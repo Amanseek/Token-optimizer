@@ -28,6 +28,24 @@ class Settings:
     # Header used to tag requests with an engineer/team name. Stripped before forwarding.
     user_header: str = field(default_factory=lambda: os.getenv("TOKENWISE_USER_HEADER", "x-tokenwise-user"))
     team_header: str = field(default_factory=lambda: os.getenv("TOKENWISE_TEAM_HEADER", "x-tokenwise-team"))
+    # Optional label for which app feature made the call (e.g. "tarot", "voice").
+    feature_header: str = field(default_factory=lambda: os.getenv("TOKENWISE_FEATURE_HEADER", "x-tokenwise-feature"))
+    # Send this header with any value to skip the response cache for one request.
+    nocache_header: str = "x-tokenwise-no-cache"
+
+    # Gemini (Google AI Studio API). Point the google-genai SDK here with
+    # GOOGLE_GEMINI_BASE_URL=http://<tokenwise-host>:<port>
+    gemini_upstream_url: str = field(
+        default_factory=lambda: os.getenv("TOKENWISE_GEMINI_UPSTREAM", "https://generativelanguage.googleapis.com")
+    )
+
+    # --- Response cache (exact repeats of a non-streaming request) ---
+    response_cache_enabled: bool = field(default_factory=lambda: _bool("TOKENWISE_RESPONSE_CACHE", False))
+    response_cache_ttl: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_RESPONSE_CACHE_TTL", str(7 * 86400))))
+    # Models whose names contain any of these are never cached (you usually want a fresh image each time).
+    response_cache_exclude: list[str] = field(
+        default_factory=lambda: _list("TOKENWISE_RESPONSE_CACHE_EXCLUDE", ["image", "tts"])
+    )
 
     # --- Caching ---
     cache_enabled: bool = field(default_factory=lambda: _bool("TOKENWISE_CACHE", True))

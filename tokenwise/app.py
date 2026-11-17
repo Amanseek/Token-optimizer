@@ -1,16 +1,19 @@
 """The proxy server.
 
-Point an Anthropic client (e.g. Claude Code) at this server instead of
-api.anthropic.com. Requests to /v1/messages are optimized, forwarded, and
-logged. Everything else is passed through unchanged.
+Anthropic clients (e.g. Claude Code): set ANTHROPIC_BASE_URL to this server.
+Gemini clients (google-genai SDK): set GOOGLE_GEMINI_BASE_URL to this server.
+
+Requests are optimized, forwarded, and logged. Anything not handled
+explicitly is passed through unchanged.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
+import os
+import ssl
 import time
 from contextlib import asynccontextmanager
 
@@ -18,43 +21,18 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from . import dashboard, routing
+from . import dashboard, gemini, routing
+from .common import cache_key, cacheable, forward_headers, identity, response_headers
 from .config import Settings, settings as default_settings
 from .db import Store
 from .pricing import Usage, cost, price_for
-from .transforms import optimize
+from .transforms import TransformStats, optimize
 
 log = logging.getLogger("tokenwise")
 
-HOP_HEADERS = {
-    "host", "content-length", "connection", "keep-alive", "transfer-encoding",
-    "accept-encoding", "proxy-authorization", "proxy-connection", "upgrade", "te",
-}
-DROP_RESPONSE_HEADERS = {"content-length", "content-encoding", "transfer-encoding", "connection"}
-
-
-def _identity(request: Request, s: Settings) -> tuple[str, str | None]:
-    engineer = request.headers.get(s.user_header)
-    team = request.headers.get(s.team_header)
-    if not engineer:
-        key = request.headers.get("x-api-key") or request.headers.get("authorization") or ""
-        engineer = "key-" + hashlib.sha256(key.encode()).hexdigest()[:8] if key else "unknown"
-    return engineer, team
-
-
-def _forward_headers(request: Request, s: Settings) -> dict[str, str]:
-    skip = HOP_HEADERS | {s.user_header, s.team_header}
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in skip}
-    headers["accept-encoding"] = "identity"
-    return headers
-
-
-def _response_headers(resp: httpx.Response) -> dict[str, str]:
-    return {k: v for k, v in resp.headers.items() if k.lower() not in DROP_RESPONSE_HEADERS}
-
 
 class SSEUsage:
-    """Pulls usage numbers out of a server-sent-event stream as it passes through."""
+    """Pulls usage numbers out of an Anthropic server-sent-event stream as it passes through."""
 
     def __init__(self):
         self.buf = ""
@@ -106,31 +84,38 @@ def create_app(
     s: Settings | None = None,
     store: Store | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
+    gemini_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     s = s or default_settings
     store = store or Store(s.db_path)
+    timeout = httpx.Timeout(connect=15.0, read=600.0, write=120.0, pool=15.0)
+    # Honour SSL_CERT_FILE (custom CA bundles, corporate proxies, self-signed test upstreams).
+    verify = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"]) if os.environ.get("SSL_CERT_FILE") else True
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.client = httpx.AsyncClient(
-            base_url=s.upstream_url,
-            transport=transport,
-            timeout=httpx.Timeout(connect=15.0, read=600.0, write=120.0, pool=15.0),
+        app.state.client = httpx.AsyncClient(base_url=s.upstream_url, transport=transport, timeout=timeout, verify=verify)
+        app.state.gemini_client = httpx.AsyncClient(
+            base_url=s.gemini_upstream_url, transport=gemini_transport or transport, timeout=timeout, verify=verify
         )
         yield
         await app.state.client.aclose()
+        await app.state.gemini_client.aclose()
 
     app = FastAPI(title="Tokenwise", lifespan=lifespan)
     app.state.store = store
     app.state.settings = s
 
-    async def _log(row: dict) -> None:
+    async def log_row(row: dict) -> None:
         try:
             await asyncio.to_thread(store.log_request, row)
         except Exception:  # logging must never break a request
             log.exception("failed to log request")
 
-    def _row(engineer, team, conv, decision, model_used, stream, status, started, usage, stats, route_label):
+    app.state.log_row = log_row
+
+    def _row(who, conv, decision, model_used, stream, status, started, usage, stats, route_label):
+        engineer, team, feature = who
         requested = decision.original_model
         actual = cost(model_used, usage)
         saved = stats.trimmed_chars + stats.deduped_chars
@@ -141,8 +126,10 @@ def create_app(
         if decision.mode == "shadow" and decision.target_model:
             shadow_cost = cost(decision.target_model, usage)
         return {
+            "provider": "anthropic",
             "engineer": engineer,
             "team": team,
+            "feature": feature,
             "conversation": conv,
             "model_requested": requested,
             "model_used": model_used,
@@ -163,6 +150,8 @@ def create_app(
             "shadow_cost_usd": shadow_cost,
         }
 
+    # ================================================================ Anthropic
+
     @app.post("/v1/messages")
     async def messages(request: Request):
         started = time.time()
@@ -173,13 +162,28 @@ def create_app(
         except ValueError:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
 
-        engineer, team = _identity(request, s)
-        headers = _forward_headers(request, s)
+        who = identity(request, s)
+        headers = forward_headers(request, s)
         params = dict(request.query_params)
         stream = bool(body.get("stream"))
 
+        # ---- exact-repeat response cache (non-streaming only)
+        rkey = None
+        if not stream and cacheable(request, s, body.get("model") or ""):
+            rkey = cache_key(request, "anthropic", "/v1/messages", body)
+            hit = await asyncio.to_thread(store.cache_get, rkey, s.response_cache_ttl)
+            if hit:
+                await log_row({
+                    "provider": "anthropic", "engineer": who[0], "team": who[1], "feature": who[2],
+                    "model_requested": body.get("model"), "model_used": hit["model"], "route_decision": "cache-hit",
+                    "stream": 0, "status": 200, "latency_ms": int((time.time() - started) * 1000),
+                    "cost_usd": 0.0, "baseline_cost_usd": hit["cost_usd"],
+                })
+                return Response(content=hit["body"], status_code=200, media_type=hit["content_type"],
+                                headers={"x-tokenwise-cache": "hit", "x-tokenwise-model": hit["model"]})
+
         opt_body, stats = optimize(body, s)
-        conv = routing.conversation_key(body, engineer)
+        conv = routing.conversation_key(body, who[0])
         decision = await asyncio.to_thread(routing.decide, opt_body, conv, s, store)
 
         route_label = "none"
@@ -200,21 +204,24 @@ def create_app(
                 model_used, route_label = decision.original_model, "fallback"
                 resp = await client.post("/v1/messages", content=body_for(model_used), headers=headers, params=params)
             usage = Usage()
-            data = None
             if resp.status_code == 200:
                 data = resp.json()
                 usage = Usage.from_api(data.get("usage"))
                 why = _cascade_needed(data) if (decision.apply and s.cascade_enabled and route_label == "routed") else None
                 if why:
                     # Log the cheap attempt (it was paid for), then retry on the original model.
-                    await _log(_row(engineer, team, conv, decision, model_used, False, 200, started, usage, stats, "cascade-attempt"))
+                    await log_row(_row(who, conv, decision, model_used, False, 200, started, usage, stats, "cascade-attempt"))
                     await asyncio.to_thread(routing.mark_failed, conv, store, why)
                     model_used, route_label = decision.original_model, "cascaded"
                     resp = await client.post("/v1/messages", content=body_for(model_used), headers=headers, params=params)
-                    data = resp.json() if resp.status_code == 200 else None
-                    usage = Usage.from_api((data or {}).get("usage"))
-            await _log(_row(engineer, team, conv, decision, model_used, False, resp.status_code, started, usage, stats, route_label))
-            out_headers = _response_headers(resp)
+                    data = resp.json() if resp.status_code == 200 else {}
+                    usage = Usage.from_api(data.get("usage"))
+            row = _row(who, conv, decision, model_used, False, resp.status_code, started, usage, stats, route_label)
+            await log_row(row)
+            if rkey and resp.status_code == 200:
+                await asyncio.to_thread(store.cache_put, rkey, resp.content,
+                                        resp.headers.get("content-type", "application/json"), model_used, row["baseline_cost_usd"])
+            out_headers = response_headers(resp)
             out_headers["x-tokenwise-model"] = model_used  # which model actually answered
             return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
 
@@ -234,13 +241,12 @@ def create_app(
         if resp.status_code != 200:
             content = await resp.aread()
             await resp.aclose()
-            await _log(_row(engineer, team, conv, decision, model_used, True, resp.status_code, started, Usage(), stats, route_label))
-            return Response(content=content, status_code=resp.status_code, headers=_response_headers(resp))
+            await log_row(_row(who, conv, decision, model_used, True, resp.status_code, started, Usage(), stats, route_label))
+            return Response(content=content, status_code=resp.status_code, headers=response_headers(resp))
 
         tracker = SSEUsage()
-        out_headers = _response_headers(resp)
+        out_headers = response_headers(resp)
         out_headers["x-tokenwise-model"] = model_used
-        final = {"model": model_used, "label": route_label}
 
         async def relay():
             try:
@@ -249,13 +255,15 @@ def create_app(
                     yield chunk
             finally:
                 await resp.aclose()
-                await _log(_row(engineer, team, conv, decision, final["model"], True, 200, started,
-                                tracker.usage, stats, final["label"]))
+                await log_row(_row(who, conv, decision, model_used, True, 200, started, tracker.usage, stats, route_label))
 
         return StreamingResponse(relay(), status_code=200, headers=out_headers,
                                  media_type=resp.headers.get("content-type", "text/event-stream"))
 
-    # ---------------- dashboard
+    # ================================================================ Gemini
+    gemini.register(app, s, store)
+
+    # ================================================================ dashboard
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dash(days: int = 30):
         return HTMLResponse(await asyncio.to_thread(dashboard.render_html, store, days))
@@ -268,13 +276,15 @@ def create_app(
     async def health():
         return {"ok": True}
 
-    # ---------------- passthrough for everything else (count_tokens, models, ...)
+    # ================================================================ passthrough
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def passthrough(path: str, request: Request):
-        client: httpx.AsyncClient = app.state.client
+        client: httpx.AsyncClient = (
+            app.state.gemini_client if gemini.is_gemini_request(request, path) else app.state.client
+        )
         req = client.build_request(
             request.method, "/" + path, content=await request.body(),
-            headers=_forward_headers(request, s), params=dict(request.query_params),
+            headers=forward_headers(request, s), params=dict(request.query_params),
         )
         resp = await client.send(req, stream=True)
 
@@ -285,6 +295,9 @@ def create_app(
             finally:
                 await resp.aclose()
 
-        return StreamingResponse(relay(), status_code=resp.status_code, headers=_response_headers(resp))
+        return StreamingResponse(relay(), status_code=resp.status_code, headers=response_headers(resp))
 
     return app
+
+
+__all__ = ["create_app", "TransformStats"]

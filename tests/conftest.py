@@ -53,14 +53,42 @@ def upstream():
     return Upstream()
 
 
+GEMINI_USAGE = {"promptTokenCount": 2000, "candidatesTokenCount": 400, "thoughtsTokenCount": 100,
+                "totalTokenCount": 2500}
+
+
+def gemini_reply(text="Your reading", usage=None):
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}, "finishReason": "STOP"}],
+            "usageMetadata": usage or GEMINI_USAGE, "modelVersion": "gemini-3.1-flash-lite"}
+
+
+class GeminiUpstream(Upstream):
+    def default(self, request, body):
+        path = request.url.path
+        if path.endswith(":streamGenerateContent"):
+            chunks = [gemini_reply("Your ", {"promptTokenCount": 2000}), gemini_reply("reading")]
+            data = "".join(f"data: {json.dumps(c)}\r\n\r\n" for c in chunks)
+            return httpx.Response(200, content=data.encode(), headers={"content-type": "text/event-stream"})
+        if path.endswith(":generateContent"):
+            return httpx.Response(200, json=gemini_reply())
+        return httpx.Response(200, json={"path": path})
+
+
 @pytest.fixture
-def make_client(tmp_path, upstream):
+def gemini_upstream():
+    return GeminiUpstream()
+
+
+@pytest.fixture
+def make_client(tmp_path, upstream, gemini_upstream):
     clients = []
 
     def _make(**overrides):
-        s = Settings(db_path=str(tmp_path / "t.db"), upstream_url="https://upstream.test", **overrides)
+        opts = {"upstream_url": "https://upstream.test", "gemini_upstream_url": "https://gemini.test", **overrides}
+        s = Settings(db_path=str(tmp_path / "t.db"), **opts)
         store = Store(s.db_path)
-        app = create_app(s, store, transport=httpx.MockTransport(upstream))
+        app = create_app(s, store, transport=httpx.MockTransport(upstream),
+                         gemini_transport=httpx.MockTransport(gemini_upstream))
         c = TestClient(app)
         c.__enter__()
         clients.append(c)

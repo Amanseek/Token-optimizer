@@ -51,7 +51,22 @@ def summary(store: Store, days: int = 30) -> dict:
                   SUM(COALESCE(cost_usd - shadow_cost_usd, 0)) AS shadow_potential_savings
            FROM requests WHERE ts >= ? GROUP BY route_decision"""
     )
-    for rows in (by_engineer, by_day):
+    by_provider = q(
+        """SELECT COALESCE(provider,'anthropic') AS provider, COUNT(*) AS requests,
+                  SUM(cost_usd) AS cost, SUM(baseline_cost_usd) AS baseline
+           FROM requests WHERE ts >= ? GROUP BY provider ORDER BY cost DESC"""
+    )
+    by_feature = q(
+        """SELECT COALESCE(feature,'(unlabeled)') AS feature, COUNT(*) AS requests,
+                  SUM(cost_usd) AS cost, SUM(baseline_cost_usd) AS baseline,
+                  SUM(COALESCE(audio_tokens,0)) AS audio_tokens
+           FROM requests WHERE ts >= ? GROUP BY feature ORDER BY cost DESC"""
+    )
+    cache = q(
+        """SELECT COUNT(*) AS hits, COALESCE(SUM(baseline_cost_usd),0) AS saved
+           FROM requests WHERE ts >= ? AND route_decision = 'cache-hit'"""
+    )[0]
+    for rows in (by_engineer, by_day, by_provider, by_feature):
         for r in rows:
             r["savings"] = (r.get("baseline") or 0) - (r.get("cost") or 0)
 
@@ -60,6 +75,9 @@ def summary(store: Store, days: int = 30) -> dict:
         "totals": totals,
         "by_engineer": by_engineer,
         "by_model": by_model,
+        "by_provider": by_provider,
+        "by_feature": by_feature,
+        "response_cache": cache,
         "by_day": by_day,
         "routing": routing,
     }
@@ -94,6 +112,20 @@ def render_html(store: Store, days: int = 30) -> str:
         [[r["engineer"], r["team"], r["requests"], _money(r["cost"]), _money(r["savings"]), f"{r['output_tokens'] or 0:,}"]
          for r in s["by_engineer"]],
     )
+    providers = _table(
+        ["Provider", "Requests", "Spend", "Saved"],
+        [[r["provider"], r["requests"], _money(r["cost"]), _money(r["savings"])] for r in s["by_provider"]],
+    )
+    features = _table(
+        ["Feature", "Requests", "Spend", "Saved", "Audio tokens"],
+        [[r["feature"], r["requests"], _money(r["cost"]), _money(r["savings"]), f"{r['audio_tokens'] or 0:,}"]
+         for r in s["by_feature"]],
+    )
+    rc = s["response_cache"]
+    cache_note = (
+        f"<p class=note>Response cache: {rc['hits']:,} repeat requests answered from cache, "
+        f"saving {_money(rc['saved'])}.</p>" if rc["hits"] else ""
+    )
     models = _table(["Model", "Requests", "Spend"], [[r["model"], r["requests"], _money(r["cost"])] for r in s["by_model"]])
     daily = _table(
         ["Day", "Requests", "Spend", "Saved"],
@@ -125,7 +157,9 @@ th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}} th{{color:#6b7
 </style></head><body>
 <h1>Tokenwise</h1><div class=note>Last {days} days · savings are estimates</div>
 <div class=tiles>{tile_html}</div>
-{opt_note}
+{opt_note}{cache_note}
+<h2>By provider</h2>{providers}
+<h2>By feature</h2>{features}
 <h2>By engineer</h2>{eng}
 <h2>By model</h2>{models}
 <h2>Routing</h2>{routing}{shadow_note}

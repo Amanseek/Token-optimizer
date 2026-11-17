@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS requests (
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_engineer ON requests(engineer);
 
+CREATE TABLE IF NOT EXISTS response_cache (
+    key TEXT PRIMARY KEY,
+    created REAL NOT NULL,
+    content_type TEXT,
+    body BLOB NOT NULL,
+    model TEXT,
+    cost_usd REAL DEFAULT 0,
+    hits INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS route_decisions (
     conversation TEXT PRIMARY KEY,
     target_model TEXT,           -- NULL means 'keep original model'
@@ -45,6 +55,13 @@ CREATE TABLE IF NOT EXISTS route_decisions (
 """
 
 
+NEW_COLUMNS = {
+    "provider": "TEXT DEFAULT 'anthropic'",
+    "feature": "TEXT",
+    "audio_tokens": "INTEGER DEFAULT 0",
+}
+
+
 class Store:
     def __init__(self, path: str):
         self.path = path
@@ -52,6 +69,11 @@ class Store:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        # Columns added after v0.1; add them to older databases.
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(requests)")}
+        for col, decl in NEW_COLUMNS.items():
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
         self._conn.commit()
 
     def log_request(self, row: dict[str, Any]) -> None:
@@ -78,6 +100,30 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO route_decisions (conversation, target_model, reason, ts) VALUES (?, ?, ?, ?)",
                 (conversation, target_model, reason, time.time()),
+            )
+            self._conn.commit()
+
+    # ---------------- response cache
+    def cache_get(self, key: str, ttl: int) -> dict[str, Any] | None:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM response_cache WHERE key = ?", (key,))
+            r = cur.fetchone()
+            if r is None:
+                return None
+            if time.time() - r["created"] > ttl:
+                self._conn.execute("DELETE FROM response_cache WHERE key = ?", (key,))
+                self._conn.commit()
+                return None
+            self._conn.execute("UPDATE response_cache SET hits = hits + 1 WHERE key = ?", (key,))
+            self._conn.commit()
+            return dict(r)
+
+    def cache_put(self, key: str, body: bytes, content_type: str, model: str, cost_usd: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO response_cache (key, created, content_type, body, model, cost_usd, hits) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0)",
+                (key, time.time(), content_type, body, model, cost_usd),
             )
             self._conn.commit()
 

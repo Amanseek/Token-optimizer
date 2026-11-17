@@ -1,7 +1,7 @@
 # Tokenwise
 
-A proxy that sits between AI coding agents (like Claude Code) and the Anthropic API.
-It **tracks AI spend per engineer** and **cuts token costs** without changing your workflow.
+A proxy that sits between your apps or AI coding agents and the model APIs (**Anthropic** and **Google Gemini**).
+It **tracks AI spend per engineer, app feature and model** and **cuts token costs** without code changes.
 
 ```
 Claude Code ──► Tokenwise proxy ──► api.anthropic.com
@@ -54,6 +54,38 @@ docker build -t tokenwise .
 docker run -p 8787:8787 -v $PWD/data:/data tokenwise
 ```
 
+## Google Gemini
+
+Any app using the official `google-genai` SDK can go through Tokenwise with **one environment variable** and no code changes:
+
+```bash
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8787
+```
+
+| Gemini endpoint | What Tokenwise does |
+|---|---|
+| `models/*:generateContent` | Logs tokens and cost; optional response cache |
+| `models/*:streamGenerateContent` | Streams through; logs final usage |
+| Live API (`/ws/...BidiGenerateContent`, voice) | Relays the WebSocket in both directions; logs per-session cost |
+| Everything else (`countTokens`, `embedContent`, files) | Passed through |
+
+Costs are calculated per **modality**, because audio is several times more expensive than text. Thinking tokens are billed as output, and cached tokens get the cache discount. Live sessions are billed every turn on the whole session context, so Tokenwise adds up every usage message in the session.
+
+**Voice needs TLS.** The SDK always opens Live sessions over `wss://`, even when the base URL is `http://`. So if your app uses Live, run Tokenwise behind HTTPS: deploy it on a host that provides TLS (Railway, Render, Cloud Run), or set `TOKENWISE_SSL_CERTFILE` and `TOKENWISE_SSL_KEYFILE`.
+
+### Feature labels (optional)
+
+Send `x-tokenwise-feature: tarot` (or `voice`, `rag`, ...) to see spend per app feature on the dashboard. With google-genai: `genai.Client(api_key=..., http_options=types.HttpOptions(headers={"x-tokenwise-feature": "tarot"}))`. The header is stripped before forwarding.
+
+## Response cache (optional)
+
+`TOKENWISE_RESPONSE_CACHE=true` answers **exact repeats** of a non-streaming request (same model, same prompt, same API key) from cache, without calling the model. This helps with page refreshes, retries and reopened readings, and it also keeps answers consistent for identical questions.
+
+- Off by default. TTL `TOKENWISE_RESPONSE_CACHE_TTL` (seconds, default 7 days).
+- Models containing `image` or `tts` are never cached (`TOKENWISE_RESPONSE_CACHE_EXCLUDE`).
+- Skip it for one request with the header `x-tokenwise-no-cache: 1`.
+- Works for Anthropic and Gemini. Cache hits show on the dashboard with the money saved.
+
 ## Recommended rollout
 
 1. **Week 1: shadow mode (default).** Logging, caching, trimming and dedupe are on. Routing only logs what it *would* do. The dashboard shows potential routing savings.
@@ -83,6 +115,12 @@ All settings are environment variables.
 | `TOKENWISE_ROUTE_MAX_TOKENS` | `30000` | Larger contexts are never routed |
 | `TOKENWISE_CASCADE` | `true` | Retry failed cheap answers on the original model |
 | `TOKENWISE_PRICES_JSON` | — | Override prices, e.g. `{"claude-opus-5-5": {"input": 4, "output": 20, "cache_write_5m": 5, "cache_write_1h": 8, "cache_read": 0.2}}` |
+| `TOKENWISE_GEMINI_UPSTREAM` | `https://generativelanguage.googleapis.com` | Gemini API |
+| `TOKENWISE_GEMINI_PRICES_JSON` | — | Override Gemini prices, e.g. `{"gemini-3.1-flash-lite": {"input": {"TEXT": 0.25, "AUDIO": 0.5}, "output": {"TEXT": 1.5}}}` |
+| `TOKENWISE_RESPONSE_CACHE` | `false` | Answer exact repeats from cache |
+| `TOKENWISE_RESPONSE_CACHE_TTL` | `604800` | Seconds |
+| `TOKENWISE_RESPONSE_CACHE_EXCLUDE` | `image,tts` | Never cache models containing these |
+| `TOKENWISE_SSL_CERTFILE` / `_KEYFILE` | — | Serve HTTPS directly (needed for Gemini Live without a TLS host) |
 
 ## How savings are calculated
 
@@ -104,6 +142,8 @@ python evals/run_eval.py evals/tasks.jsonl
 
 Each task runs once directly and once through the proxy. You get cost and pass/fail for both, plus a CSV. Add your own tasks to `tasks.jsonl` (each has a `prompt` and a `check` regex).
 
+For a Gemini app, `evals/prankundli_bench.py` runs real app code (PranKundali's tarot module and the SDK's Live client) twice, directly and through Tokenwise, and compares what reaches the API. By default it uses `evals/fake_gemini.py`, so it needs no key; pass `--real` with `GEMINI_API_KEY` for real numbers.
+
 The stronger test, for selling to teams: take 50–100 real tasks from your own repos, run the agent on each with and without Tokenwise, and compare **cost per task where the tests still pass**.
 
 ## Tests
@@ -115,8 +155,9 @@ python -m pytest -q
 
 ## Known limits
 
-- **Anthropic API only** for now (Claude Code). OpenAI/Codex is the next step.
-- **Prices** in `tokenwise/pricing.py` come from public sources (Nov 2026). Check them against Anthropic's pricing page.
+- **Anthropic and Gemini (AI Studio API)** only. Vertex AI and OpenAI/Codex are not supported yet.
+- **Prices** in `tokenwise/pricing.py` and `tokenwise/gemini_pricing.py` come from public sources (Nov 2026), and some Gemini entries are approximate. Check them against the providers' pricing pages.
+- **Routing, trimming and dedupe apply to Anthropic only.** Gemini requests are logged and optionally cached, never modified.
 - **Cascade** only works for non-streaming requests. Claude Code streams, so for it only the HTTP-error fallback applies.
 - **Routing rules are keyword-based.** The logs (`route_decisions` and `requests` tables) are the training data for a learned router later.
 - **The cheap model may not support every feature** the client sends. Rejected requests fall back automatically, and that conversation stops being routed.
