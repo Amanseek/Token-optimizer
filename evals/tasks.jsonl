@@ -1,0 +1,6 @@
+{"id": "explain-fib", "prompt": "Explain what this Python function does in two sentences:\n\ndef f(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a", "check": "fibonacci"}
+{"id": "rename-var", "prompt": "Rename the variable `x` to `total_price` in this code and return only the code:\n\nx = 0\nfor item in cart:\n    x += item.price\nprint(x)", "check": "total_price \\+= item\\.price"}
+{"id": "commit-message", "prompt": "Write a one-line git commit message for a change that fixes a null pointer crash when the user has no profile photo.", "check": "(fix|handle|prevent).*(photo|avatar|profile)"}
+{"id": "sql-index", "prompt": "A query `SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 10` is slow on a 50M row table. Suggest one index. Answer with the CREATE INDEX statement only.", "check": "create index.*\\(\\s*customer_id\\s*,\\s*created_at"}
+{"id": "debug-off-by-one", "prompt": "Debug this: the function should return the last element but crashes.\n\ndef last(xs):\n    return xs[len(xs)]\n\nReturn the fixed function only.", "check": "xs\\[(len\\(xs\\)\\s*-\\s*1|-1)\\]"}
+{"id": "regex-email", "prompt": "Explain in one sentence what this regex matches: ^\\d{3}-\\d{4}$", "check": "(digit|number)"}
