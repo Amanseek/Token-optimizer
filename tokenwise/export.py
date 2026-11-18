@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from .db import Store
-from .traces import is_proprietary
+from .traces import is_proprietary, unseal_row
 
 
 def usable_rows(store: Store, client: str | None, workflow: str | None, days: int) -> list[dict]:
@@ -42,6 +42,7 @@ def usable_rows(store: Store, client: str | None, workflow: str | None, days: in
 
 def to_example(row: dict, allow_provider_outputs: bool) -> tuple[dict | None, str]:
     """(chat example or None, why skipped)."""
+    row = unseal_row(row)
     if row.get("corrected_output"):
         target, source = row["corrected_output"], "corrected"
     else:
@@ -111,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
         with (out / name).open("w", encoding="utf-8") as f:
             for ex in part:
                 f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+    store.audit("cli", "export", f"{a.client or 'all'}/{a.workflow or 'all'}",
+                f"{len(examples)} examples, provider_outputs={a.allow_provider_outputs}")
     print(f"wrote {len(examples) - n_test} train + {n_test} test examples to {out}/"
           + (f"; skipped {skipped}" if skipped else ""))
     return 0

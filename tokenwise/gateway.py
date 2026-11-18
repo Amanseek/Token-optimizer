@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 
 from fastapi.responses import JSONResponse
@@ -76,6 +77,8 @@ def prepare(conn: HTTPConnection, provider: str, s: Settings, store: Store) -> C
         if not conn.headers.get(s.user_header):
             engineer = client.name
         capture, mask = client.capture, client.mask
+        if capture and client.capture_rate < 1.0 and random.random() >= client.capture_rate:
+            capture = False  # sampled out: logged for cost, conversation not stored
     else:
         capture, mask = s.traces_enabled, s.traces_mask
 

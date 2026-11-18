@@ -66,6 +66,7 @@ class Client:
     mask: bool
     openai_base_url: str | None
     _row: dict
+    capture_rate: float = 1.0
 
     def upstream_key(self, provider: str) -> str | None:
         enc = self._row.get(f"{provider}_key_enc")
@@ -108,7 +109,9 @@ def find_by_key(store: Store, key: str) -> Client | None:
     if not rows:
         return None
     r = rows[0]
-    return Client(r["id"], r["name"], bool(r["capture"]), bool(r["mask"]), r["openai_base_url"], r)
+    rate = r.get("capture_rate")
+    return Client(r["id"], r["name"], bool(r["capture"]), bool(r["mask"]), r["openai_base_url"], r,
+                  1.0 if rate is None else float(rate))
 
 
 def presented_key(conn: HTTPConnection) -> str:

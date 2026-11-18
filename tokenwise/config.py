@@ -57,6 +57,8 @@ class Settings:
     traces_mask: bool = field(default_factory=lambda: _bool("TOKENWISE_TRACES_MASK", True))
     # The same user input again within this many seconds marks the earlier answer as not good.
     retry_window_s: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_RETRY_WINDOW", "600")))
+    # Traces from traffic without a client key are deleted after this many days (clients have their own setting).
+    trace_retention_days: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_TRACE_RETENTION_DAYS", "90")))
     trace_max_chars: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_TRACE_MAX_CHARS", "200000")))
 
     # --- Response cache (exact repeats of a non-streaming request) ---

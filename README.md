@@ -96,6 +96,21 @@ python -m tokenwise.export --client acme --workflow f:support-reply --out data/ 
 ```
 Corrected answers always export. Answers from OpenAI, Google and Anthropic hosts export only with `--allow-provider-outputs`, because their terms restrict training models that compete with them; answers from open models (e.g. via OpenRouter, Together, vLLM) export by default. Check each host's terms.
 
+### Data protection
+
+| Control | How |
+|---|---|
+| Encryption in transit | Serve over HTTPS: `TOKENWISE_SSL_CERTFILE` / `TOKENWISE_SSL_KEYFILE`, or a host/proxy that terminates TLS |
+| Encryption at rest | With `TOKENWISE_SECRET` set, stored prompts, answers, tool calls, notes and corrections are encrypted (upstream keys always are). The workflow label (first 60 characters of the client's own system prompt) stays readable for the dashboard |
+| Masking | Personal data masked before storing (per-client switch) |
+| Store less | `admin sample acme 0.1` stores 10% of conversations; `admin capture acme off` stores none (cost is still logged) |
+| Retention | Traces auto-delete after `retention_days` (default 90; `admin retention acme 30`); checked hourly |
+| Delete on request | `POST /tokenwise/v1/delete` with the client key: `{"user": "<x-tokenwise-user value>"}`, `{"trace_ids": [...]}` or `{"all": true}`; or `admin purge acme --user U123` |
+| Isolation | A client key only reaches that client's traces; exports are per client |
+| Access log | Dashboard/API views, exports, deletions and admin changes are recorded: `admin audit` |
+
+For per-user deletion, the client's app should send its own (pseudonymous) user id in `x-tokenwise-user`. The cost log (`requests` table) holds no conversation content.
+
 Traffic without a `tw-` key still passes through with the caller's own key (set `TOKENWISE_REQUIRE_CLIENT_KEY=1` to refuse it). Capture for that traffic is off unless `TOKENWISE_TRACES=1`.
 
 ## Google Gemini
@@ -139,7 +154,7 @@ Send `x-tokenwise-feature: tarot` (or `voice`, `rag`, ...) to see spend per app 
 
 ## Configuration
 
-New gateway settings: `TOKENWISE_SECRET` (encrypts upstream keys), `TOKENWISE_OPENAI_UPSTREAM` (default `https://api.openai.com/v1`, for traffic without a client key), `TOKENWISE_OPENAI_PRICES` (JSON, USD per million tokens, e.g. `{"deepseek-chat": [0.27, 1.1]}`), `TOKENWISE_REQUIRE_CLIENT_KEY`, `TOKENWISE_ADMIN_TOKEN` (protects `/dashboard` and `/api/*`), `TOKENWISE_TRACES`, `TOKENWISE_TRACES_MASK`, `TOKENWISE_RETRY_WINDOW` (seconds, default 600).
+New gateway settings: `TOKENWISE_SECRET` (encrypts upstream keys), `TOKENWISE_OPENAI_UPSTREAM` (default `https://api.openai.com/v1`, for traffic without a client key), `TOKENWISE_OPENAI_PRICES` (JSON, USD per million tokens, e.g. `{"deepseek-chat": [0.27, 1.1]}`), `TOKENWISE_REQUIRE_CLIENT_KEY`, `TOKENWISE_ADMIN_TOKEN` (protects `/dashboard` and `/api/*`), `TOKENWISE_TRACES`, `TOKENWISE_TRACES_MASK`, `TOKENWISE_RETRY_WINDOW` (seconds, default 600), `TOKENWISE_TRACE_RETENTION_DAYS` (traffic without a client key, default 90).
 
 
 All settings are environment variables.

@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE INDEX IF NOT EXISTS idx_traces_wf ON traces(client_id, workflow_key, ts);
 CREATE INDEX IF NOT EXISTS idx_traces_retry ON traces(client_id, engineer, workflow_key, input_hash, ts);
 
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    actor TEXT,                        -- admin (dashboard/API), cli, or client:<name>
+    action TEXT,                       -- view_dashboard, export, delete, create_client, ...
+    target TEXT,
+    detail TEXT
+);
+
 CREATE TABLE IF NOT EXISTS route_decisions (
     conversation TEXT PRIMARY KEY,
     target_model TEXT,           -- NULL means 'keep original model'
@@ -103,6 +112,11 @@ CREATE TABLE IF NOT EXISTS route_decisions (
 );
 """
 
+
+CLIENT_NEW_COLUMNS = {
+    "capture_rate": "REAL DEFAULT 1.0",    # share of requests to capture (0-1)
+    "retention_days": "INTEGER DEFAULT 90", # traces older than this are deleted automatically
+}
 
 NEW_COLUMNS = {
     "provider": "TEXT DEFAULT 'anthropic'",
@@ -123,7 +137,15 @@ class Store:
         for col, decl in NEW_COLUMNS.items():
             if col not in have:
                 self._conn.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(clients)")}
+        for col, decl in CLIENT_NEW_COLUMNS.items():
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE clients ADD COLUMN {col} {decl}")
         self._conn.commit()
+
+    def audit(self, actor: str, action: str, target: str = "", detail: str = "") -> None:
+        self.insert("audit", {"ts": time.time(), "actor": actor, "action": action, "target": target,
+                              "detail": detail})
 
     def log_request(self, row: dict[str, Any]) -> None:
         row = {"ts": time.time(), **row}

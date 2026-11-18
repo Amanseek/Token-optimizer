@@ -16,7 +16,8 @@ success (automatic):
      was sent again within the retry window (the earlier trace is marked 0)
 feedback (from the app): POST /tokenwise/v1/feedback with the x-tokenwise-trace-id header value.
 
-Traces contain users' prompts: personal data is masked by default (see masking.py).
+Traces contain users' prompts: personal data is masked by default (see masking.py), and
+when TOKENWISE_SECRET is set the content columns are also encrypted at rest (SEALED below).
 """
 
 from __future__ import annotations
@@ -29,6 +30,31 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .masking import mask_obj, mask_text
+
+SEALED = ("system", "messages", "last_user", "output_text", "tool_calls", "feedback_note", "corrected_output")
+SEAL_PREFIX = "enc:v1:"
+
+
+def seal(value):
+    """Encrypt a text value with TOKENWISE_SECRET; returned unchanged if no secret is set."""
+    if value is None or value == "" or str(value).startswith(SEAL_PREFIX):
+        return value
+    import os
+    if not os.getenv("TOKENWISE_SECRET"):
+        return value
+    from .clients import encrypt
+    return SEAL_PREFIX + encrypt(str(value))
+
+
+def unseal(value):
+    if isinstance(value, str) and value.startswith(SEAL_PREFIX):
+        from .clients import decrypt
+        return decrypt(value[len(SEAL_PREFIX):])
+    return value
+
+
+def unseal_row(row: dict) -> dict:
+    return {k: (unseal(v) if k in SEALED else v) for k, v in row.items()}
 
 TRACE_HEADER = "x-tokenwise-trace-id"
 GOOD_FINISH = {"stop", "tool_calls"}
@@ -287,7 +313,32 @@ def save(store, row: dict, retry_window_s: int) -> None:
             "AND COALESCE(client_id,'') = COALESCE(?,'') AND engineer = ? AND ts >= ? AND success = 1",
             (row["input_hash"], row["workflow_key"], row["client_id"], row["engineer"], row["ts"] - retry_window_s),
         )
-    store.insert("traces", row)
+    store.insert("traces", {k: (seal(v) if k in SEALED else v) for k, v in row.items()})
+
+
+def purge_expired(store, default_retention_days: int) -> int:
+    """Delete traces past their retention period (per client; the default for traffic without a client)."""
+    now = time.time()
+    n = 0
+    for c in store.query("SELECT id, retention_days FROM clients"):
+        days = c["retention_days"] if c["retention_days"] is not None else default_retention_days
+        n += store.execute("DELETE FROM traces WHERE client_id = ? AND ts < ?", (c["id"], now - days * 86400))
+    n += store.execute("DELETE FROM traces WHERE client_id IS NULL AND ts < ?", (now - default_retention_days * 86400,))
+    return n
+
+
+def delete_for(store, client_id: str | None, *, user: str | None = None, trace_ids: list[str] | None = None,
+               everything: bool = False) -> int:
+    """Delete a client's traces: for one end user (the x-tokenwise-user value), given ids, or all."""
+    scope, params = "COALESCE(client_id,'') = COALESCE(?,'')", [client_id]
+    if everything:
+        return store.execute(f"DELETE FROM traces WHERE {scope}", tuple(params))
+    n = 0
+    if user:
+        n += store.execute(f"DELETE FROM traces WHERE {scope} AND engineer = ?", (*params, user))
+    for tid in trace_ids or []:
+        n += store.execute(f"DELETE FROM traces WHERE {scope} AND id = ?", (*params, tid))
+    return n
 
 
 def tool_sequence(tool_calls_json: str) -> str:

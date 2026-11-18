@@ -14,7 +14,7 @@ CHAT = {"model": "deepseek-chat", "messages": [
 
 
 def traces_of(store):
-    return store.query("SELECT * FROM traces ORDER BY ts")
+    return [traces.unseal_row(r) for r in store.query("SELECT * FROM traces ORDER BY ts")]
 
 
 def make_acme(store, **kw):
@@ -281,3 +281,102 @@ def test_admin_cli(tmp_path, monkeypatch, capsys):
     assert admin_main(["--db", db, "capture", "acme", "off"]) == 0
     with pytest.raises(SystemExit):
         admin_main(["--db", db, "create", "acme2", "--gemini-key-env", "MISSING_VAR"])
+
+
+# ------------------------------------------------------------------ data protection (milestone 1.5)
+
+def test_trace_content_encrypted_at_rest(make_client):
+    client, store = make_client()
+    _, key = make_acme(store)
+    client.post(OA, json=CHAT, headers={"authorization": f"Bearer {key}"})
+    [raw] = store.query("SELECT * FROM traces")
+    for col in ("system", "messages", "last_user", "output_text"):
+        assert raw[col].startswith(traces.SEAL_PREFIX), col
+    dumped = json.dumps({k: v for k, v in raw.items() if k != "workflow_label"})
+    assert "Your reading" not in dumped and "support replies" not in dumped
+    assert traces.unseal_row(raw)["output_text"] == "Your reading"
+
+
+def test_no_secret_means_plain_storage(make_client, monkeypatch):
+    client, store = make_client(traces_enabled=True)
+    monkeypatch.delenv("TOKENWISE_SECRET")
+    client.post(OA, json=CHAT, headers={"authorization": "Bearer sk-own"})
+    assert store.query("SELECT output_text FROM traces")[0]["output_text"] == "Your reading"
+
+
+def test_sampling_rate(make_client):
+    client, store = make_client()
+    _, key = make_acme(store)
+    store.execute("UPDATE clients SET capture_rate = 0 WHERE name = 'acme'")
+    r = client.post(OA, json=CHAT, headers={"authorization": f"Bearer {key}"})
+    assert r.status_code == 200 and traces.TRACE_HEADER not in r.headers
+    assert traces_of(store) == [] and len(store.query("SELECT * FROM requests")) == 1  # cost still logged
+
+
+def test_retention_purge(make_client):
+    client, store = make_client()
+    _, key = make_acme(store)
+    client.post(OA, json=CHAT, headers={"authorization": f"Bearer {key}"})
+    assert traces.purge_expired(store, 90) == 0
+    store.execute("UPDATE clients SET retention_days = 0 WHERE name = 'acme'")
+    assert traces.purge_expired(store, 90) == 1 and traces_of(store) == []
+
+
+def test_delete_on_request_by_user_and_all(make_client):
+    client, store = make_client()
+    _, key = make_acme(store)
+    _, other = clients.create_client(store, "other", {"openai": "sk-o"})
+    auth = {"authorization": f"Bearer {key}"}
+    for user in ("u1", "u1", "u2"):
+        client.post(OA, json={**CHAT, "messages": [{"role": "user", "content": f"hi from {user} {len(user)}"}]},
+                    headers={**auth, "x-tokenwise-user": user})
+    client.post(OA, json=CHAT, headers={"authorization": f"Bearer {other}", "x-tokenwise-user": "u1"})
+    r = client.post("/tokenwise/v1/delete", json={"user": "u1"}, headers=auth)
+    assert r.json() == {"ok": True, "deleted": 2}
+    left = traces_of(store)
+    assert sorted(t["engineer"] for t in left) == ["u1", "u2"]  # other client's u1 untouched
+    assert client.post("/tokenwise/v1/delete", json={"all": True}, headers=auth).json()["deleted"] == 1
+    assert client.post("/tokenwise/v1/delete", json={}, headers=auth).status_code == 400
+    [entry] = store.query("SELECT * FROM audit WHERE action = 'delete' AND target = 'user:u1'")
+    assert entry["actor"] == "client:acme" and entry["detail"] == "2 traces deleted"
+
+
+def test_audit_log_for_dashboard_and_export(make_client, tmp_path):
+    client, store = make_client()
+    _, key = make_acme(store)
+    client.post(OA, json=CHAT, headers={"authorization": f"Bearer {key}"})
+    client.get("/dashboard")
+    export.main(["--db", store.path, "--out", str(tmp_path / "e")])
+    actions = [r["action"] for r in store.query("SELECT action FROM audit ORDER BY id")]
+    assert "view_dashboard" in actions and "export" in actions
+
+
+def test_export_decrypts_sealed_traces(make_client, tmp_path):
+    client, store = make_client()
+    _, key = make_acme(store)
+    client.post(OA, json=CHAT, headers={"authorization": f"Bearer {key}"})
+    assert export.main(["--db", store.path, "--out", str(tmp_path / "d")]) == 0
+    [ex] = [json.loads(x) for x in (tmp_path / "d" / "train.jsonl").read_text().splitlines()]
+    assert ex["messages"][-1]["content"] == "Your reading"
+
+
+def test_admin_cli_data_controls(tmp_path, monkeypatch, capsys):
+    from tokenwise.db import Store
+    db = str(tmp_path / "c.db")
+    monkeypatch.setenv("K", "sk")
+    admin_main(["--db", db, "create", "acme", "--openai-key-env", "K"])
+    assert admin_main(["--db", db, "sample", "acme", "0.25"]) == 0
+    assert admin_main(["--db", db, "retention", "acme", "30"]) == 0
+    assert admin_main(["--db", db, "sample", "acme", "2"]) == 1
+    capsys.readouterr()
+    admin_main(["--db", db, "list"])
+    assert "sample=25%" in capsys.readouterr().out
+    store = Store(db)
+    cid = store.query("SELECT id FROM clients")[0]["id"]
+    store.insert("traces", {"id": "t1", "ts": 0, "client_id": cid, "engineer": "u9", "workflow_key": "w"})
+    assert admin_main(["--db", db, "purge", "acme", "--user", "u9"]) == 0
+    assert store.query("SELECT COUNT(*) AS n FROM traces")[0]["n"] == 0
+    capsys.readouterr()
+    admin_main(["--db", db, "audit"])
+    out = capsys.readouterr().out
+    assert "delete" in out and "sample" in out and "create" in out

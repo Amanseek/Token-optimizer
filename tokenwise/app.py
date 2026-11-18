@@ -104,7 +104,20 @@ def create_app(
         )
         app.state.openai_client = httpx.AsyncClient(transport=openai_transport or transport, timeout=timeout,
                                                      verify=verify)
+
+        async def purge_loop():
+            while True:
+                try:
+                    n = await asyncio.to_thread(traces.purge_expired, store, s.trace_retention_days)
+                    if n:
+                        log.info("deleted %d traces past their retention period", n)
+                except Exception:
+                    log.exception("trace purge failed")
+                await asyncio.sleep(3600)
+
+        purger = asyncio.create_task(purge_loop())
         yield
+        purger.cancel()
         await app.state.client.aclose()
         await app.state.gemini_client.aclose()
         await app.state.openai_client.aclose()
@@ -303,6 +316,7 @@ def create_app(
     async def dash(request: Request, days: int = 30):
         if not admin_ok(request):
             return HTMLResponse("Forbidden: add ?token=<TOKENWISE_ADMIN_TOKEN>", status_code=403)
+        await asyncio.to_thread(store.audit, "admin", "view_dashboard", request.client.host if request.client else "")
         return HTMLResponse(await asyncio.to_thread(dashboard.render_html, store, days))
 
     @app.get("/api/summary")
