@@ -21,8 +21,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from . import dashboard, gemini, routing
-from .common import cache_key, cacheable, forward_headers, identity, response_headers
+from . import dashboard, gateway, gemini, openai_compat, routing, traces, workflows
+from .common import cache_key, cacheable, response_headers
 from .config import Settings, settings as default_settings
 from .db import Store
 from .pricing import Usage, cost, price_for
@@ -34,8 +34,9 @@ log = logging.getLogger("tokenwise")
 class SSEUsage:
     """Pulls usage numbers out of an Anthropic server-sent-event stream as it passes through."""
 
-    def __init__(self):
+    def __init__(self, on_event=None):
         self.buf = ""
+        self.on_event = on_event
         self.usage = Usage()
         self.model: str | None = None
         self.stop_reason: str | None = None
@@ -51,6 +52,8 @@ class SSEUsage:
                     data = json.loads(line[5:].strip())
                 except ValueError:
                     continue
+                if self.on_event:
+                    self.on_event(data)
                 kind = data.get("type")
                 if kind == "message_start":
                     msg = data.get("message") or {}
@@ -85,6 +88,7 @@ def create_app(
     store: Store | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     gemini_transport: httpx.AsyncBaseTransport | None = None,
+    openai_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
     s = s or default_settings
     store = store or Store(s.db_path)
@@ -98,9 +102,12 @@ def create_app(
         app.state.gemini_client = httpx.AsyncClient(
             base_url=s.gemini_upstream_url, transport=gemini_transport or transport, timeout=timeout, verify=verify
         )
+        app.state.openai_client = httpx.AsyncClient(transport=openai_transport or transport, timeout=timeout,
+                                                     verify=verify)
         yield
         await app.state.client.aclose()
         await app.state.gemini_client.aclose()
+        await app.state.openai_client.aclose()
 
     app = FastAPI(title="Tokenwise", lifespan=lifespan)
     app.state.store = store
@@ -162,10 +169,12 @@ def create_app(
         except ValueError:
             return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON"}}, 400)
 
-        who = identity(request, s)
-        headers = forward_headers(request, s)
-        params = dict(request.query_params)
+        ctx = gateway.prepare(request, "anthropic", s, store)
+        if isinstance(ctx, Response):
+            return ctx
+        who, headers, params = ctx.who, ctx.headers, ctx.params
         stream = bool(body.get("stream"))
+        collector = traces.OutputCollector("anthropic")
 
         # ---- exact-repeat response cache (non-streaming only)
         rkey = None
@@ -218,11 +227,21 @@ def create_app(
                     usage = Usage.from_api(data.get("usage"))
             row = _row(who, conv, decision, model_used, False, resp.status_code, started, usage, stats, route_label)
             await log_row(row)
+            if resp.status_code == 200:
+                try:
+                    collector.add(resp.json())
+                except ValueError:
+                    pass
+            await gateway.record(ctx, store, s, model=model_used, status=resp.status_code, stream=False, body=body,
+                                 collector=collector, input_tokens=usage.input_tokens + usage.cache_read_input_tokens
+                                 + usage.cache_creation_input_tokens, output_tokens=usage.output_tokens,
+                                 cost_usd=row["cost_usd"], started=started)
             if rkey and resp.status_code == 200:
                 await asyncio.to_thread(store.cache_put, rkey, resp.content,
                                         resp.headers.get("content-type", "application/json"), model_used, row["baseline_cost_usd"])
             out_headers = response_headers(resp)
             out_headers["x-tokenwise-model"] = model_used  # which model actually answered
+            out_headers.update(gateway.trace_headers(ctx))
             return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
 
         # ---------------- streaming
@@ -242,11 +261,14 @@ def create_app(
             content = await resp.aread()
             await resp.aclose()
             await log_row(_row(who, conv, decision, model_used, True, resp.status_code, started, Usage(), stats, route_label))
+            await gateway.record(ctx, store, s, model=model_used, status=resp.status_code, stream=True, body=body,
+                                 collector=collector, started=started)
             return Response(content=content, status_code=resp.status_code, headers=response_headers(resp))
 
-        tracker = SSEUsage()
+        tracker = SSEUsage(on_event=collector.add)
         out_headers = response_headers(resp)
         out_headers["x-tokenwise-model"] = model_used
+        out_headers.update(gateway.trace_headers(ctx))
 
         async def relay():
             try:
@@ -255,21 +277,38 @@ def create_app(
                     yield chunk
             finally:
                 await resp.aclose()
-                await log_row(_row(who, conv, decision, model_used, True, 200, started, tracker.usage, stats, route_label))
+                srow = _row(who, conv, decision, model_used, True, 200, started, tracker.usage, stats, route_label)
+                await log_row(srow)
+                u = tracker.usage
+                await gateway.record(ctx, store, s, model=model_used, status=200, stream=True, body=body,
+                                     collector=collector, input_tokens=u.input_tokens + u.cache_read_input_tokens
+                                     + u.cache_creation_input_tokens, output_tokens=u.output_tokens,
+                                     cost_usd=srow["cost_usd"], started=started)
 
         return StreamingResponse(relay(), status_code=200, headers=out_headers,
                                  media_type=resp.headers.get("content-type", "text/event-stream"))
 
     # ================================================================ Gemini
     gemini.register(app, s, store)
+    openai_compat.register(app, s, store)
+    workflows.register(app, s, store)
+
+    def admin_ok(request: Request) -> bool:
+        if not s.admin_token:
+            return True
+        return s.admin_token in (request.query_params.get("token"), request.headers.get("x-tokenwise-admin"))
 
     # ================================================================ dashboard
     @app.get("/dashboard", response_class=HTMLResponse)
-    async def dash(days: int = 30):
+    async def dash(request: Request, days: int = 30):
+        if not admin_ok(request):
+            return HTMLResponse("Forbidden: add ?token=<TOKENWISE_ADMIN_TOKEN>", status_code=403)
         return HTMLResponse(await asyncio.to_thread(dashboard.render_html, store, days))
 
     @app.get("/api/summary")
-    async def summary(days: int = 30):
+    async def summary(request: Request, days: int = 30):
+        if not admin_ok(request):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
         return JSONResponse(await asyncio.to_thread(dashboard.summary, store, days))
 
     @app.get("/healthz")
@@ -279,12 +318,13 @@ def create_app(
     # ================================================================ passthrough
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def passthrough(path: str, request: Request):
-        client: httpx.AsyncClient = (
-            app.state.gemini_client if gemini.is_gemini_request(request, path) else app.state.client
-        )
+        is_gemini = gemini.is_gemini_request(request, path)
+        client: httpx.AsyncClient = app.state.gemini_client if is_gemini else app.state.client
+        ctx = gateway.prepare(request, "gemini" if is_gemini else "anthropic", s, store)
+        if isinstance(ctx, Response):
+            return ctx
         req = client.build_request(
-            request.method, "/" + path, content=await request.body(),
-            headers=forward_headers(request, s), params=dict(request.query_params),
+            request.method, "/" + path, content=await request.body(), headers=ctx.headers, params=ctx.params,
         )
         resp = await client.send(req, stream=True)
 

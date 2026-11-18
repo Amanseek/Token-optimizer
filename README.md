@@ -1,7 +1,7 @@
 # Tokenwise
 
-A proxy that sits between your apps or AI coding agents and the model APIs (**Anthropic** and **Google Gemini**).
-It **tracks AI spend per engineer, app feature and model** and **cuts token costs** without code changes.
+A gateway that sits between your apps or AI coding agents and the model APIs (**OpenAI-compatible hosts**, **Google Gemini** and **Anthropic**).
+It **tracks AI spend per client, engineer, app feature and model**, **cuts token costs**, and **captures traces of real work** (prompts, answers, tool calls, success and feedback) so you can train smaller custom models on them. No app code changes: apps only switch their base URL and API key.
 
 ```
 Claude Code ──► Tokenwise proxy ──► api.anthropic.com
@@ -54,6 +54,50 @@ docker build -t tokenwise .
 docker run -p 8787:8787 -v $PWD/data:/data tokenwise
 ```
 
+## Multi-client gateway and trace capture
+
+Each client gets a Tokenwise key (`tw-...`). Their app sends it instead of the provider key; Tokenwise swaps in the client's real provider key (stored encrypted on the server), so the app can't bypass the gateway.
+
+```bash
+python -m tokenwise.admin new-secret                  # once; export the output as TOKENWISE_SECRET
+export ACME_OPENAI_KEY=sk-...                         # the client's provider key (never typed as an argument)
+python -m tokenwise.admin create acme --openai-key-env ACME_OPENAI_KEY \
+    --openai-base-url https://openrouter.ai/api/v1    # prints acme's tw- key (shown once)
+python -m tokenwise.admin set-key acme gemini --key-env ACME_GEMINI_KEY
+python -m tokenwise.admin list | rotate acme | disable acme | capture acme off | mask acme off
+```
+
+The client's app changes two settings:
+
+| SDK | Base URL | API key |
+|---|---|---|
+| OpenAI (and any OpenAI-compatible host) | `OPENAI_BASE_URL=http://<host>:8787/openai/v1` | `tw-...` |
+| google-genai | `GOOGLE_GEMINI_BASE_URL=http://<host>:8787` | `tw-...` |
+| Anthropic | `ANTHROPIC_BASE_URL=http://<host>:8787` | `tw-...` |
+
+Optional header `x-tokenwise-feature: <name>` labels the app feature (e.g. `support-reply`). Without it, traces are grouped by system prompt.
+
+**What a trace holds:** system prompt, the conversation (normalised across providers), declared tools, the answer, tool calls made, finish reason, tokens, cost and latency.
+
+**Personal data is masked before storing** (emails, phone numbers, UPI IDs, PAN, Aadhaar, card numbers, long digit runs). The system prompt is the client's own and is kept. Masking can be turned off per client.
+
+**Success signals:**
+- automatic: HTTP error, blocked, cut off (length) or empty means not good; the same user input again within 10 minutes marks the earlier answer not good (a retry);
+- from the app: every response carries `x-tokenwise-trace-id`; the app can send
+  `POST /tokenwise/v1/feedback {"trace_id": ..., "rating": "good"|"bad", "note": ..., "corrected_output": ...}`
+  with its `tw-` key. A corrected answer is the best training data.
+
+**Workflows:** `/dashboard` and `/api/workflows` show, per client and workflow: volume, success rate, 👍/👎, corrected, retried, how many traces are usable for training, spend, and the most common tool sequences.
+
+**Export a training set:**
+```bash
+python -m tokenwise.export --list
+python -m tokenwise.export --client acme --workflow f:support-reply --out data/   # train.jsonl + test.jsonl
+```
+Corrected answers always export. Answers from OpenAI, Google and Anthropic hosts export only with `--allow-provider-outputs`, because their terms restrict training models that compete with them; answers from open models (e.g. via OpenRouter, Together, vLLM) export by default. Check each host's terms.
+
+Traffic without a `tw-` key still passes through with the caller's own key (set `TOKENWISE_REQUIRE_CLIENT_KEY=1` to refuse it). Capture for that traffic is off unless `TOKENWISE_TRACES=1`.
+
 ## Google Gemini
 
 Any app using the official `google-genai` SDK can go through Tokenwise with **one environment variable** and no code changes:
@@ -94,6 +138,9 @@ Send `x-tokenwise-feature: tarot` (or `voice`, `rag`, ...) to see spend per app 
 4. Run the eval (below) to confirm quality holds.
 
 ## Configuration
+
+New gateway settings: `TOKENWISE_SECRET` (encrypts upstream keys), `TOKENWISE_OPENAI_UPSTREAM` (default `https://api.openai.com/v1`, for traffic without a client key), `TOKENWISE_OPENAI_PRICES` (JSON, USD per million tokens, e.g. `{"deepseek-chat": [0.27, 1.1]}`), `TOKENWISE_REQUIRE_CLIENT_KEY`, `TOKENWISE_ADMIN_TOKEN` (protects `/dashboard` and `/api/*`), `TOKENWISE_TRACES`, `TOKENWISE_TRACES_MASK`, `TOKENWISE_RETRY_WINDOW` (seconds, default 600).
+
 
 All settings are environment variables.
 

@@ -19,13 +19,15 @@ import logging
 import os
 import ssl
 import time
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
 from starlette.websockets import WebSocketDisconnect
 
-from .common import cache_key, cacheable, forward_headers, identity, response_headers
+from . import gateway, traces
+from .common import cache_key, cacheable, response_headers
 from .config import Settings
 from .db import Store
 from .gemini_pricing import GeminiTokens, gemini_cost
@@ -56,8 +58,9 @@ class GeminiStreamUsage:
     array. Each chunk repeats the running totals, so the last one wins.
     """
 
-    def __init__(self, sse: bool):
+    def __init__(self, sse: bool, collector: "traces.OutputCollector | None" = None):
         self.sse = sse
+        self.collector = collector
         self.buf = ""
         self.usage: dict | None = None
         self.model_version: str | None = None
@@ -66,6 +69,8 @@ class GeminiStreamUsage:
         items = data if isinstance(data, list) else [data]
         for d in items:
             if isinstance(d, dict):
+                if self.collector:
+                    self.collector.add(d)
                 if d.get("usageMetadata"):
                     self.usage = d["usageMetadata"]
                 self.model_version = d.get("modelVersion") or self.model_version
@@ -124,19 +129,22 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
         log_row = app.state.log_row
         path = f"/{version}/models/{model_action}"
         raw = await request.body()
-        headers = forward_headers(request, s)
-        params = dict(request.query_params)
+        ctx = gateway.prepare(request, "gemini", s, store)
+        if isinstance(ctx, Response):
+            return ctx
+        headers, params = ctx.headers, ctx.params
         model, _, method = model_action.partition(":")
 
         if version not in GEMINI_VERSIONS or method not in {"generateContent", "streamGenerateContent"}:
             resp = await client.post(path, content=raw, headers=headers, params=params)
             return Response(content=resp.content, status_code=resp.status_code, headers=response_headers(resp))
 
-        who = identity(request, s)
+        who = ctx.who
         try:
             body = json.loads(raw) if raw else {}
         except ValueError:
             body = None
+        collector = traces.OutputCollector("gemini")
 
         # ---------------- generateContent
         if method == "generateContent":
@@ -155,13 +163,18 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
                 try:
                     data = resp.json()
                     cost_usd, tokens = gemini_cost(model, data.get("usageMetadata"))
+                    collector.add(data)
                 except ValueError:
                     pass
             await log_row(row(who, model, resp.status_code, started, False, tokens, cost_usd))
+            await gateway.record(ctx, store, s, model=model, status=resp.status_code, stream=False, body=body,
+                                 collector=collector, input_tokens=tokens.input_tokens,
+                                 output_tokens=tokens.output_tokens, cost_usd=cost_usd, started=started)
             if rkey and resp.status_code == 200:
                 await asyncio.to_thread(store.cache_put, rkey, resp.content,
                                         resp.headers.get("content-type", "application/json"), model, cost_usd)
-            return Response(content=resp.content, status_code=resp.status_code, headers=response_headers(resp))
+            return Response(content=resp.content, status_code=resp.status_code,
+                            headers={**response_headers(resp), **gateway.trace_headers(ctx)})
 
         # ---------------- streamGenerateContent
         req = client.build_request("POST", path, content=raw, headers=headers, params=params)
@@ -170,9 +183,11 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
             content = await resp.aread()
             await resp.aclose()
             await log_row(row(who, model, resp.status_code, started, True, GeminiTokens(), 0.0))
+            await gateway.record(ctx, store, s, model=model, status=resp.status_code, stream=True, body=body,
+                                 collector=collector, started=started)
             return Response(content=content, status_code=resp.status_code, headers=response_headers(resp))
 
-        tracker = GeminiStreamUsage(sse=params.get("alt") == "sse")
+        tracker = GeminiStreamUsage(sse=params.get("alt") == "sse", collector=collector)
 
         async def relay():
             try:
@@ -184,8 +199,12 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
                 tracker.finish()
                 cost_usd, tokens = gemini_cost(model, tracker.usage)
                 await log_row(row(who, model, 200, started, True, tokens, cost_usd))
+                await gateway.record(ctx, store, s, model=model, status=200, stream=True, body=body,
+                                     collector=collector, input_tokens=tokens.input_tokens,
+                                     output_tokens=tokens.output_tokens, cost_usd=cost_usd, started=started)
 
-        return StreamingResponse(relay(), status_code=200, headers=response_headers(resp),
+        return StreamingResponse(relay(), status_code=200,
+                                 headers={**response_headers(resp), **gateway.trace_headers(ctx)},
                                  media_type=resp.headers.get("content-type"))
 
     # ---------------- Live API (voice) over WebSocket
@@ -194,11 +213,15 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
         import websockets  # imported here so the HTTP proxy works without it
 
         started = time.time()
-        who = identity(ws, s)
+        ctx = gateway.prepare(ws, "gemini", s, store)
+        if isinstance(ctx, Response):
+            await ws.close(code=1008, reason="invalid Tokenwise key")
+            return
+        who = ctx.who
         skip = WS_SKIP_HEADERS | {s.user_header, s.team_header, s.feature_header, s.nocache_header}
-        headers = {k: v for k, v in ws.headers.items() if k.lower() not in skip}
+        headers = {k: v for k, v in ctx.headers.items() if k.lower() not in skip}
         base = s.gemini_upstream_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
-        query = ws.url.query
+        query = urlencode(ctx.params)
         uri = f"{base}/ws/{path}" + (f"?{query}" if query else "")
 
         await ws.accept()

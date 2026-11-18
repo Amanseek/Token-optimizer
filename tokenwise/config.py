@@ -39,6 +39,26 @@ class Settings:
         default_factory=lambda: os.getenv("TOKENWISE_GEMINI_UPSTREAM", "https://generativelanguage.googleapis.com")
     )
 
+    # OpenAI-compatible APIs (OpenAI, OpenRouter, Together, Groq, DeepSeek, vLLM, ...).
+    # Apps set their base URL to http://<tokenwise-host>:<port>/openai/v1
+    openai_upstream_url: str = field(
+        default_factory=lambda: os.getenv("TOKENWISE_OPENAI_UPSTREAM", "https://api.openai.com/v1")
+    )
+
+    # --- Multi-client gateway ---
+    # Reject requests that don't carry a tw- client key (otherwise provider keys pass through).
+    require_client_key: bool = field(default_factory=lambda: _bool("TOKENWISE_REQUIRE_CLIENT_KEY", False))
+    # Protects /dashboard and /api/* when set (send ?token=... or header x-tokenwise-admin).
+    admin_token: str = field(default_factory=lambda: os.getenv("TOKENWISE_ADMIN_TOKEN", ""))
+
+    # --- Trace capture (full prompts and answers, for training) ---
+    # Client accounts have their own capture switch; this one covers traffic without a client key.
+    traces_enabled: bool = field(default_factory=lambda: _bool("TOKENWISE_TRACES", False))
+    traces_mask: bool = field(default_factory=lambda: _bool("TOKENWISE_TRACES_MASK", True))
+    # The same user input again within this many seconds marks the earlier answer as not good.
+    retry_window_s: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_RETRY_WINDOW", "600")))
+    trace_max_chars: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_TRACE_MAX_CHARS", "200000")))
+
     # --- Response cache (exact repeats of a non-streaming request) ---
     response_cache_enabled: bool = field(default_factory=lambda: _bool("TOKENWISE_RESPONSE_CACHE", False))
     response_cache_ttl: int = field(default_factory=lambda: int(os.getenv("TOKENWISE_RESPONSE_CACHE_TTL", str(7 * 86400))))

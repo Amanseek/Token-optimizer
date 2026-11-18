@@ -46,6 +46,55 @@ CREATE TABLE IF NOT EXISTS response_cache (
     hits INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    key_hash TEXT UNIQUE NOT NULL,     -- sha256 of the tw- gateway key (the key itself is never stored)
+    key_prefix TEXT,                   -- first characters, to recognise a key in lists
+    created REAL,
+    active INTEGER DEFAULT 1,
+    capture INTEGER DEFAULT 1,         -- store traces for this client
+    mask INTEGER DEFAULT 1,            -- mask personal data in stored traces
+    openai_base_url TEXT,              -- any OpenAI-compatible host
+    openai_key_enc TEXT,               -- upstream keys, encrypted with TOKENWISE_SECRET
+    gemini_key_enc TEXT,
+    anthropic_key_enc TEXT
+);
+
+CREATE TABLE IF NOT EXISTS traces (
+    id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    client_id TEXT,
+    provider TEXT,                     -- openai | gemini | anthropic
+    upstream_host TEXT,
+    engineer TEXT,
+    feature TEXT,
+    workflow_key TEXT,                 -- feature label, or a hash of the system prompt
+    workflow_label TEXT,
+    model TEXT,
+    status INTEGER,
+    stream INTEGER,
+    system TEXT,
+    messages TEXT,                     -- conversation sent, normalised (JSON)
+    tools TEXT,                        -- declared tool names (JSON list)
+    last_user TEXT,
+    input_hash TEXT,
+    output_text TEXT,
+    tool_calls TEXT,                   -- tool calls the model made (JSON list)
+    finish TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL DEFAULT 0,
+    latency_ms INTEGER,
+    success INTEGER,                   -- automatic: 1 ok; 0 error/blocked/cut off/empty/retried
+    reason TEXT,
+    feedback INTEGER,                  -- from the app: 1 good, 0 bad, NULL none
+    feedback_note TEXT,
+    corrected_output TEXT              -- a better answer supplied by the app or a reviewer
+);
+CREATE INDEX IF NOT EXISTS idx_traces_wf ON traces(client_id, workflow_key, ts);
+CREATE INDEX IF NOT EXISTS idx_traces_retry ON traces(client_id, engineer, workflow_key, input_hash, ts);
+
 CREATE TABLE IF NOT EXISTS route_decisions (
     conversation TEXT PRIMARY KEY,
     target_model TEXT,           -- NULL means 'keep original model'
@@ -126,6 +175,20 @@ class Store:
                 (key, time.time(), content_type, body, model, cost_usd),
             )
             self._conn.commit()
+
+    # ---------------- generic helpers (clients, traces)
+    def insert(self, table: str, row: dict[str, Any]) -> None:
+        cols = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        with self._lock:
+            self._conn.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})", list(row.values()))
+            self._conn.commit()
+
+    def execute(self, sql: str, params: tuple = ()) -> int:
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            self._conn.commit()
+            return cur.rowcount
 
     def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         with self._lock:

@@ -79,8 +79,45 @@ def gemini_upstream():
     return GeminiUpstream()
 
 
+class OpenAIUpstream(Upstream):
+    """Fake OpenAI-compatible API (chat completions, streamed or not)."""
+
+    reply = "Your reading"
+    finish = "stop"
+
+    def default(self, request, body):
+        if request.url.path.endswith("/chat/completions"):
+            usage = {"prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500}
+            if body.get("stream"):
+                chunks = [
+                    {"id": "c1", "model": body["model"], "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Your "}}]},
+                    {"id": "c1", "model": body["model"], "choices": [{"index": 0, "delta": {"content": "reading"}, "finish_reason": self.finish}]},
+                ]
+                if (body.get("stream_options") or {}).get("include_usage"):
+                    chunks.append({"id": "c1", "model": body["model"], "choices": [], "usage": usage})
+                data = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+                return httpx.Response(200, content=data.encode(), headers={"content-type": "text/event-stream"})
+            return httpx.Response(200, json={
+                "id": "c1", "object": "chat.completion", "model": body["model"],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": self.reply},
+                             "finish_reason": self.finish}],
+                "usage": usage})
+        return httpx.Response(200, json={"path": request.url.path})
+
+
 @pytest.fixture
-def make_client(tmp_path, upstream, gemini_upstream):
+def openai_upstream():
+    return OpenAIUpstream()
+
+
+@pytest.fixture(autouse=True)
+def tokenwise_secret(monkeypatch):
+    from tokenwise.clients import new_secret
+    monkeypatch.setenv("TOKENWISE_SECRET", new_secret())
+
+
+@pytest.fixture
+def make_client(tmp_path, upstream, gemini_upstream, openai_upstream):
     clients = []
 
     def _make(**overrides):
@@ -88,7 +125,8 @@ def make_client(tmp_path, upstream, gemini_upstream):
         s = Settings(db_path=str(tmp_path / "t.db"), **opts)
         store = Store(s.db_path)
         app = create_app(s, store, transport=httpx.MockTransport(upstream),
-                         gemini_transport=httpx.MockTransport(gemini_upstream))
+                         gemini_transport=httpx.MockTransport(gemini_upstream),
+                         openai_transport=httpx.MockTransport(openai_upstream))
         c = TestClient(app)
         c.__enter__()
         clients.append(c)

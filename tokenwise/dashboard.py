@@ -143,6 +143,19 @@ def render_html(store: Store, days: int = 30) -> str:
         f"<p class=note>Trimmed {t['trimmed_chars']:,} chars of tool output, removed {t['deduped_chars']:,} chars of "
         f"duplicate output, added {t['breakpoints_added']:,} cache breakpoints.</p>"
     )
+    from .workflows import summary as wf_summary  # local import: workflows imports nothing from here
+
+    wf_rows = wf_summary(store, days)
+    wf = _table(
+        ["Client", "Workflow", "Requests", "Success", "👍 / 👎", "Corrected", "Retried", "Trainable", "Spend",
+         "Avg in / out tokens", "Top tool sequence"],
+        [[r["client"], r["workflow_label"], r["requests"], f"{r['success_pct']}%", f"{r['good']} / {r['bad']}",
+          r["corrected"], r["retried"], r["trainable"], _money(r["cost"]),
+          f"{int(r['avg_in'] or 0):,} / {int(r['avg_out'] or 0):,}",
+          (r["top_tool_sequences"][0]["sequence"] if r["top_tool_sequences"] else "")] for r in wf_rows],
+    )
+    wf_section = (f"<h2>Workflows (captured traces)</h2>{wf}<p class=note>Trainable = succeeded and not rated "
+                  f"bad, or corrected by a person. Export with: python -m tokenwise.export</p>") if wf_rows else ""
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><title>Tokenwise</title>
 <style>
@@ -158,6 +171,7 @@ th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}} th{{color:#6b7
 <h1>Tokenwise</h1><div class=note>Last {days} days · savings are estimates</div>
 <div class=tiles>{tile_html}</div>
 {opt_note}{cache_note}
+{wf_section}
 <h2>By provider</h2>{providers}
 <h2>By feature</h2>{features}
 <h2>By engineer</h2>{eng}
