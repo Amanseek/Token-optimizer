@@ -110,6 +110,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--check-tokens", type=int, default=120)
     a = ap.parse_args(argv)
 
+    import os
+    # Plain `python train.py` on a multi-GPU box (Kaggle T4 x2): TRL refuses nn.DataParallel,
+    # so use one GPU unless launched with accelerate/torchrun (which set LOCAL_RANK).
+    if "LOCAL_RANK" not in os.environ:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     import torch
     from datasets import Dataset
     from peft import LoraConfig
