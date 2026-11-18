@@ -20,7 +20,7 @@ Stands in for a rented GPU server. Steps: **train** a LoRA adapter (plain TRL + 
 **serve** base model + adapter with **vLLM** → the "client app" calls it **through Tokenwise**
 with a `tw-` key → **evaluate** new vs base model → check the **captured workflow**.
 
-Settings: GPU T4 x2, Internet on. Run all (about 40–60 minutes)."""),
+Settings: GPU T4 x2, Internet on. Run all (about 40–60 minutes). Stops after ~5 minutes if the smoke test shows gibberish."""),
 
     (CODE, """%%capture
 !pip install -q -U trl peft bitsandbytes datasets
@@ -49,10 +49,22 @@ for name, part in (("train", train), ("test", test)):
             f.write(json.dumps(to_chat(r), ensure_ascii=False) + "\\n")
 print(open(f"{W}/data/test.jsonl").readline()[:400])"""),
 
-    (MD, "## 1. Train the client's adapter (QLoRA on T4)"),
-    (CODE, """t0 = time.time()
-!python {W}/tokenwise/pipeline/train.py --train {W}/data/train.jsonl --out {W}/adapters/demo-scam --base {BASE} --qlora --epochs 1 --max-len 1024
-print(f"train step took {(time.time()-t0)/60:.1f} min"); print(open(f"{W}/adapters/demo-scam/training.json").read())"""),
+    (MD, """## 1. Train the client's adapter (QLoRA on T4)
+
+First a **5-minute smoke test** (30 steps): it prints the base model's answers, trains briefly, and
+checks the new answers are real JSON, not gibberish. If that fails, the notebook stops here
+instead of spending an hour."""),
+    (CODE, """def run(cmd, what):
+    t0 = time.time(); code = subprocess.run(cmd, shell=True).returncode
+    print(f"{what} took {(time.time()-t0)/60:.1f} min, exit code {code}")
+    if code:
+        raise RuntimeError(f"{what} FAILED (exit {code}) - see the output above; stopping so no more GPU is used")
+
+TRAIN = f"python {W}/tokenwise/pipeline/train.py --train {W}/data/train.jsonl --base {BASE} --qlora --max-len 1024"
+run(f"{TRAIN} --out {W}/smoke --max-steps 30 --check 4", "smoke test")
+!rm -rf {W}/smoke"""),
+    (CODE, """run(f"{TRAIN} --out {W}/adapters/demo-scam --epochs 1 --check 8", "full training")
+print(open(f"{W}/adapters/demo-scam/training.json").read())"""),
 
     (MD, "## 2. Serve base + adapter with vLLM (separate environment, so it can't clash with training libraries)"),
     (CODE, """%%capture

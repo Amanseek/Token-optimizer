@@ -43,3 +43,17 @@ def test_scores_json_fields():
 def test_load_test(tmp_path):
     [r] = evaluate.load_test(write(tmp_path, [CONVO]), None)
     assert r["reference"] == "a" and r["prompt"] == CONVO[:2]
+
+
+def test_garbled_answers_are_caught():
+    from pipeline.train import looks_garbled, sanity_check
+    assert looks_garbled("") == "empty"
+    assert looks_garbled("the the the the the the the the the the the the the") == "repeating the same words"
+    assert looks_garbled("ababababababababababababababababababababababab") == "repeating the same characters"
+    assert looks_garbled("\x00\x01\x02 broken \x03\x04") == "unprintable characters"
+    assert looks_garbled('{"v": "scam", "c": "otp", "l": "hi", "r": ["link"]}') is None
+    assert looks_garbled("Yeh message ek scam lagta hai, kisi ko OTP mat batao.") is None
+    refs = ['{"v": "scam"}', '{"v": "safe"}']
+    assert sanity_check(['{"v": "scam"}', '{"v": "safe"}'], refs) == []
+    assert "only 0/2 answers are" in sanity_check(["scam it is", "safe one"], refs)[0]
+    assert sanity_check(["fine answer here", ""], ["a", "b"]) == ["answer 2: empty"]
