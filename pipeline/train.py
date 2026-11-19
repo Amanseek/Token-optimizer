@@ -179,6 +179,14 @@ def main(argv: list[str] | None = None) -> None:
     guard = LossGuard()
     trainer = SFTTrainer(model=model, args=args, train_dataset=Dataset.from_list(examples),
                          processing_class=tok, peft_config=lora, callbacks=[guard])
+    # fp16 mixed precision (T4) needs float32 trainable weights; some library versions create the
+    # LoRA weights in the model's bf16, which makes the fp16 grad-scaler crash. Upcast them.
+    trainable = [p for p in trainer.model.parameters() if p.requires_grad]
+    print("trainable params:", sum(p.numel() for p in trainable), "dtypes:", sorted({str(p.dtype) for p in trainable}))
+    if not bf16:
+        for p in trainable:
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
     prompts = [e["prompt"] for e in held]
     refs = [e["completion"][0]["content"] for e in held]
     if held:
