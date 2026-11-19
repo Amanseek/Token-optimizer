@@ -28,7 +28,12 @@ wait_for() {  # wait_for <url> <log> <seconds>
 }
 
 echo "== 1/6 tools"
-[ "${LOCAL_TEST:-}" = 1 ] || pip install -q -U transformers peft bitsandbytes accelerate fastapi uvicorn httpx cryptography kaggle 2>&1 | quiet
+if [ "${LOCAL_TEST:-}" != 1 ]; then
+  pip install -q -U transformers peft bitsandbytes accelerate fastapi uvicorn httpx kaggle 2>&1 | quiet
+  # the image's cryptography is a Debian package pip can't upgrade; install ours alongside it
+  python -c "import cryptography, sys; sys.exit(int(cryptography.__version__.split('.')[0]) < 42)" 2>/dev/null \
+    || pip install -q --ignore-installed "cryptography>=42" 2>&1 | quiet
+fi
 
 echo "== 2/6 GPU"
 if [ "${LOCAL_TEST:-}" = 1 ]; then echo "(local test: GPU check skipped)"; else
