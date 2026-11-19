@@ -8,7 +8,7 @@ COPY tokenwise ./tokenwise
 ENV TOKENWISE_HOST=0.0.0.0 \
     TOKENWISE_PORT=8787 \
     TOKENWISE_DB=/data/tokenwise.db
-VOLUME /data
+# Keep /data on persistent storage: docker run -v tw-data:/data ...  (Railway: attach a volume at /data)
 EXPOSE 8787
 
 CMD ["python", "-m", "tokenwise.main"]

@@ -5,6 +5,10 @@ provider's key; Tokenwise looks up the client, swaps in the client's real upstre
 (kept encrypted on the server) and forwards the request. The app never holds the
 provider key, so it can't bypass the gateway.
 
+Bring your own key: a client that won't hand over its provider key keeps sending it as
+usual and adds its tw- key in the x-tokenwise-key header. Tokenwise uses their key for
+that one request and never stores it (only usage is logged).
+
 Requests that carry a normal provider key (not tw-) still pass through unchanged,
 unless TOKENWISE_REQUIRE_CLIENT_KEY=1.
 """
@@ -123,11 +127,22 @@ def presented_key(conn: HTTPConnection) -> str:
     return h.get("x-api-key") or h.get("x-goog-api-key") or auth or conn.query_params.get("key") or ""
 
 
+GATEWAY_KEY_HEADER = "x-tokenwise-key"  # tw- key sent beside the client's own provider key
+
+
+def brings_own_key(conn: HTTPConnection) -> bool:
+    """True when the app sends its own provider key and identifies itself with x-tokenwise-key."""
+    return (conn.headers.get(GATEWAY_KEY_HEADER, "").startswith(KEY_PREFIX)
+            and not presented_key(conn).startswith(KEY_PREFIX))
+
+
 def resolve(conn: HTTPConnection, store: Store) -> tuple[Client | None, bool]:
     """(client, sent_gateway_key). A tw- key that matches no active client gives (None, True)."""
     key = presented_key(conn)
     if not key.startswith(KEY_PREFIX):
-        return None, False
+        key = conn.headers.get(GATEWAY_KEY_HEADER, "")
+        if not key.startswith(KEY_PREFIX):
+            return None, False
     return find_by_key(store, key), True
 
 

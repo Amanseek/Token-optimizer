@@ -89,6 +89,10 @@ Optional header `x-tokenwise-feature: <name>` labels the app feature (e.g. `supp
 
 **Workflows:** `/dashboard` and `/api/workflows` show, per client and workflow: volume, success rate, 👍/👎, corrected, retried, how many traces are usable for training, spend, and the most common tool sequences.
 
+**Client keeps its own provider key ("bring your own key"):** create the client without keys
+(`python -m tokenwise.admin create acme`); their app keeps sending its own OpenAI/Gemini key as usual and adds
+the header `x-tokenwise-key: tw-...`. Tokenwise uses their key for that request only and never stores it.
+
 **Safety net and shadow tests (per client, OpenAI format):**
 ```bash
 # backup model when the main one is offline, errors, gets cut off or (with --require-json) returns broken JSON

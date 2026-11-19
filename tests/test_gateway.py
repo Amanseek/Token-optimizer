@@ -380,3 +380,28 @@ def test_admin_cli_data_controls(tmp_path, monkeypatch, capsys):
     admin_main(["--db", db, "audit"])
     out = capsys.readouterr().out
     assert "delete" in out and "sample" in out and "create" in out
+
+
+# ------------------------------------------------------------------ bring your own key
+
+def test_bring_your_own_key_is_used_but_never_stored(make_client, openai_upstream, monkeypatch):
+    monkeypatch.setenv("TOKENWISE_REQUIRE_CLIENT_KEY", "1")
+    client, store = make_client(require_client_key=True)
+    _, tw = clients.create_client(store, "byok", {}, openai_base_url="https://openrouter.test/api/v1")
+    r = client.post(OA, json=CHAT, headers={"authorization": "Bearer sk-their-own", "x-tokenwise-key": tw})
+    assert r.status_code == 200
+    sent = openai_upstream.requests[-1]
+    assert sent.headers["authorization"] == "Bearer sk-their-own"
+    assert "x-tokenwise-key" not in sent.headers and str(sent.url).startswith("https://openrouter.test/")
+    [row] = store.query("SELECT * FROM requests")
+    assert row["engineer"] == "byok"  # usage counted for the client
+    with open(store.path, "rb") as f:
+        assert b"sk-their-own" not in f.read()  # their key is never written down
+
+
+def test_bring_your_own_key_needs_a_valid_gateway_key(make_client):
+    client, store = make_client(require_client_key=True)
+    bad = client.post(OA, json=CHAT, headers={"authorization": "Bearer sk-x", "x-tokenwise-key": "tw-nope"})
+    assert bad.status_code == 401
+    none = client.post(OA, json=CHAT, headers={"authorization": "Bearer sk-x"})
+    assert none.status_code == 401  # require_client_key: a bare provider key is refused

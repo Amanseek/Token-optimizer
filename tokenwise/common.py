@@ -41,7 +41,7 @@ def identity(conn: HTTPConnection, s: Settings) -> tuple[str, str | None, str | 
 
 
 def our_headers(s: Settings) -> set[str]:
-    return {s.user_header, s.team_header, s.feature_header, s.nocache_header}
+    return {s.user_header, s.team_header, s.feature_header, s.nocache_header, "x-tokenwise-key"}
 
 
 def forward_headers(conn: HTTPConnection, s: Settings) -> dict[str, str]:

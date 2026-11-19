@@ -65,7 +65,7 @@ def prepare(conn: HTTPConnection, provider: str, s: Settings, store: Store) -> C
         upstream = s.upstream_url
 
     engineer, team, feature = identity(conn, s)
-    if client:
+    if client and not clients.brings_own_key(conn):  # otherwise their own key passes through, never stored
         try:
             key = client.upstream_key(provider)
         except clients.ConfigError as e:
@@ -74,6 +74,7 @@ def prepare(conn: HTTPConnection, provider: str, s: Settings, store: Store) -> C
         if not key:
             return _error(provider, 400, f"No {provider} key is set for client '{client.name}'.")
         clients.swap_credentials(provider, key, headers, params)
+    if client:
         if not conn.headers.get(s.user_header):
             engineer = client.name
         capture, mask = client.capture, client.mask
