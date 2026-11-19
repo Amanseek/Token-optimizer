@@ -92,6 +92,19 @@ stop_all; sleep 2
 nohup python -u "$TW/pipeline/serve/hf_server.py" --adapters-dir "$ADAPTERS" --port 8000 > "$WS/model_server.log" 2>&1 &
 echo "model server loading (1-4 min the first time)..."
 wait_for http://127.0.0.1:8000/health "$WS/model_server.log" 600
+# Dashboard economics: compare with a hosted API and count the GPU's hourly cost (see tokenwise/selfhost.py).
+# E2E on-demand prices + 18% GST, Nov 2026; check your bill and override with GPU_INR_PER_HOUR if they change.
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+case "$GPU_NAME" in
+  *V100*) DEFAULT_INR=118 ;;   # ₹100/h + GST
+  *L4*)   DEFAULT_INR=58 ;;    # ₹49/h + GST
+  *)      DEFAULT_INR=0 ;;
+esac
+export TOKENWISE_INR_PER_USD=${INR_PER_USD:-95}
+export TOKENWISE_GPU_COST_PER_HOUR=$(python -c "print(round(${GPU_INR_PER_HOUR:-$DEFAULT_INR} / $TOKENWISE_INR_PER_USD, 4))")
+export TOKENWISE_OPENAI_PRICES=${TOKENWISE_OPENAI_PRICES:-'{"gemini-2.5-flash": [0.30, 2.50], "gpt-5-mini": [0.25, 2.00]}'}
+export TOKENWISE_OPENAI_COMPARE_TO=${COMPARE_TO:-gemini-2.5-flash}
+echo "dashboard compares with $TOKENWISE_OPENAI_COMPARE_TO; GPU ${GPU_NAME:-unknown} at ₹${GPU_INR_PER_HOUR:-$DEFAULT_INR}/h"
 (cd "$TW" && nohup python -m uvicorn tokenwise.main:app --host 127.0.0.1 --port 8787 > "$WS/tokenwise.log" 2>&1 &)
 wait_for http://127.0.0.1:8787/ "$WS/tokenwise.log" 60
 mkdir -p "$WS/bin"

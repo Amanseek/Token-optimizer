@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import time
 
+from . import selfhost
 from .db import Store
 
 
@@ -26,6 +27,9 @@ def summary(store: Store, days: int = 30) -> dict:
                   COUNT(DISTINCT engineer) AS engineers
            FROM requests WHERE ts >= ?"""
     )[0]
+    own = selfhost.report(store, since)
+    if own:  # the GPU is a cost too, even though it isn't billed per request
+        totals["cost"] += own["gpu_cost"]
     totals["savings"] = totals["baseline"] - totals["cost"]
     totals["savings_pct"] = (100 * totals["savings"] / totals["baseline"]) if totals["baseline"] else 0.0
     all_input = totals["input_tokens"] + totals["cache_read_tokens"] + totals["cache_write_tokens"]
@@ -80,11 +84,46 @@ def summary(store: Store, days: int = 30) -> dict:
         "response_cache": cache,
         "by_day": by_day,
         "routing": routing,
+        "self_hosted": own,
     }
 
 
 def _money(x) -> str:
-    return f"${(x or 0):,.2f}"
+    x = x or 0
+    sign, x = ("-" if x < 0 else ""), abs(x)
+    return f"{sign}${x:,.4f}" if 0 < x < 0.01 else f"{sign}${x:,.2f}"  # small amounts stay visible
+
+
+def _money_inr(x) -> str:
+    rate = selfhost.inr_per_usd()
+    return _money(x) + (f" (₹{(x or 0) * rate:,.0f})" if rate else "")
+
+
+def _self_hosted_section(r: dict | None) -> str:
+    if not r:
+        return ""
+    vs = ", ".join(r["compare_to"])
+    rows = [["Requests to your own models", f"{r['requests']:,}"],
+            [f"Same requests on {vs}", _money_inr(r["api_cost"])]]
+    if r["gpu_cost_per_hour"]:
+        rows.append(["Your GPU", f"{r['gpu_hours']:.1f} h × {_money_inr(r['gpu_cost_per_hour'])}/h = "
+                                 f"{_money_inr(r['gpu_cost'])}"])
+    if r["token_cost"]:
+        rows.append(["Per-token price set for own models", _money_inr(r["token_cost"])])
+    saved = r["saved"]
+    rows.append(["Result", f"saved {_money_inr(saved)}" if saved >= 0 else
+                 f"the API would have been cheaper by {_money_inr(-saved)}"])
+    table = _table(["", ""], rows)
+    if r["breakeven_per_hour"]:
+        note = (f"The GPU costs the same per hour however busy it is. At your current request size "
+                f"({_money(r['api_cost_per_request'] * 1000)} per 1,000 requests on {vs}), it pays off above "
+                f"<b>{r['breakeven_per_hour']:,.0f} requests per hour</b>. Busiest hour so far: "
+                f"{r['busiest_hour']:,}. Faster serving (vLLM on an L4) raises how many it can handle.")
+    elif not r["gpu_cost_per_hour"]:
+        note = "Set TOKENWISE_GPU_COST_PER_HOUR to include what the GPU costs."
+    else:
+        note = "Break-even appears after the first requests."
+    return f"<h2>Own GPU vs hosted API</h2>{table}<p class=note>{note}</p>"
 
 
 def _table(headers: list[str], rows: list[list]) -> str:
@@ -100,7 +139,8 @@ def render_html(store: Store, days: int = 30) -> str:
     tiles = [
         ("Spend", _money(t["cost"])),
         ("Without Tokenwise (est.)", _money(t["baseline"])),
-        ("Saved", f"{_money(t['savings'])} ({t['savings_pct']:.1f}%)"),
+        ("Saved", f"{_money(t['savings'])} ({t['savings_pct']:.1f}%)" if t["savings"] >= 0
+                  else f"{_money(t['savings'])} (API cheaper)"),
         ("Cache hit rate", f"{t['cache_hit_pct']:.1f}%"),
         ("Requests", f"{t['requests']:,}"),
         ("Engineers", f"{t['engineers']:,}"),
@@ -171,6 +211,7 @@ th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}} th{{color:#6b7
 <h1>Tokenwise</h1><div class=note>Last {days} days · savings are estimates</div>
 <div class=tiles>{tile_html}</div>
 {opt_note}{cache_note}
+{_self_hosted_section(s["self_hosted"])}
 {wf_section}
 <h2>By provider</h2>{providers}
 <h2>By feature</h2>{features}

@@ -11,6 +11,10 @@ Everything else under /openai/v1/ (models, embeddings, ...) is passed through.
 Prices: model names vary by host, so set them yourself (USD per million tokens):
     TOKENWISE_OPENAI_PRICES='{"gpt-5-mini": [0.25, 2.0], "deepseek-chat": [0.27, 1.1]}'
 Unknown models are logged with tokens and a cost of 0.
+
+Self-hosted models (vLLM, hf_server): set TOKENWISE_OPENAI_COMPARE_TO so "Without Tokenwise" shows
+what the hosted API they replace would have charged, and TOKENWISE_GPU_COST_PER_HOUR for the GPU
+(see selfhost.py).
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import gateway, traces
+from . import gateway, selfhost, traces
 from .common import response_headers
 from .config import Settings
 from .db import Store
@@ -59,12 +63,14 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
     def log_row(ctx: gateway.Ctx, model: str, status: int, started: float, stream: bool, usage: dict | None):
         engineer, team, feature = ctx.who
         c, inp, out, cached = price(model, usage)
+        compare = selfhost.compare_to(model)  # self-hosted model: baseline is the hosted API it replaces
+        baseline = price(compare, usage)[0] if compare else c
         return {
             "provider": "openai", "engineer": engineer, "team": team, "feature": feature,
             "model_requested": model, "model_used": model, "route_decision": "none", "stream": int(stream),
             "status": status, "latency_ms": int((time.time() - started) * 1000),
             "input_tokens": inp, "output_tokens": out, "cache_read_tokens": cached,
-            "cost_usd": c, "baseline_cost_usd": c,
+            "cost_usd": c, "baseline_cost_usd": baseline,
         }, c, inp, out
 
     @app.post(PREFIX + "/chat/completions")

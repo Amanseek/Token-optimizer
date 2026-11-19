@@ -21,7 +21,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from . import dashboard, gateway, gemini, openai_compat, routing, traces, workflows
+from . import dashboard, gateway, gemini, openai_compat, routing, selfhost, traces, workflows
 from .common import cache_key, cacheable, response_headers
 from .config import Settings, settings as default_settings
 from .db import Store
@@ -116,7 +116,21 @@ def create_app(
                 await asyncio.sleep(3600)
 
         purger = asyncio.create_task(purge_loop())
+
+        async def uptime_loop(sid: str):  # GPU hours, for the own-GPU cost on the dashboard
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await asyncio.to_thread(selfhost.beat, store, sid)
+                except Exception:
+                    log.exception("uptime update failed")
+
+        sid = await asyncio.to_thread(selfhost.start_session, store) if selfhost.gpu_cost_per_hour() else None
+        ticker = asyncio.create_task(uptime_loop(sid)) if sid else None
         yield
+        if ticker:
+            ticker.cancel()
+            await asyncio.to_thread(selfhost.beat, store, sid)
         purger.cancel()
         await app.state.client.aclose()
         await app.state.gemini_client.aclose()
