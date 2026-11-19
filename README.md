@@ -89,6 +89,18 @@ Optional header `x-tokenwise-feature: <name>` labels the app feature (e.g. `supp
 
 **Workflows:** `/dashboard` and `/api/workflows` show, per client and workflow: volume, success rate, 👍/👎, corrected, retried, how many traces are usable for training, spend, and the most common tool sequences.
 
+**Safety net and shadow tests (per client, OpenAI format):**
+```bash
+# backup model when the main one is offline, errors, gets cut off or (with --require-json) returns broken JSON
+python -m tokenwise.admin fallback acme --base-url https://generativelanguage.googleapis.com/v1beta/openai \
+    --model gemini-2.5-flash --key-env ACME_GEMINI_KEY --require-json
+# copy 20% of successful requests to a second model and score how often it agrees (scores only, no text stored)
+python -m tokenwise.admin shadow acme --base-url https://gpu.example.in/v1 --model acme-support \
+    --key-env MODEL_API_KEY --rate 0.2
+```
+Answers from the backup carry `x-tokenwise-fallback: <reason>`. The dashboard shows agreement per feature and
+fallbacks per reason. Shadow copies send the client's prompts to the shadow host: turn it on with their agreement.
+
 **Export a training set:**
 ```bash
 python -m tokenwise.export --list

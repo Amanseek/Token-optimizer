@@ -139,6 +139,7 @@ def create_app(
     app = FastAPI(title="Tokenwise", lifespan=lifespan)
     app.state.store = store
     app.state.settings = s
+    app.state.shadow_tasks = set()  # background shadow tests (kept referenced until done)
 
     async def log_row(row: dict) -> None:
         try:

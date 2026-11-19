@@ -19,20 +19,24 @@ what the hosted API they replace would have charged, and TOKENWISE_GPU_COST_PER_
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import random
 import time
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import gateway, selfhost, traces
+from . import gateway, policies, selfhost, traces
 from .common import response_headers
 from .config import Settings
 from .db import Store
 
 PREFIX = "/openai/v1"
+log = logging.getLogger("tokenwise.openai")
 
 
 def _prices() -> dict[str, tuple[float, float]]:
@@ -60,14 +64,16 @@ def price(model: str, usage: dict | None) -> tuple[float, int, int, int]:
 
 def register(app: FastAPI, s: Settings, store: Store) -> None:
 
-    def log_row(ctx: gateway.Ctx, model: str, status: int, started: float, stream: bool, usage: dict | None):
+    def log_row(ctx: gateway.Ctx, model: str, status: int, started: float, stream: bool, usage: dict | None,
+                decision: str = "none", requested: str | None = None):
         engineer, team, feature = ctx.who
         c, inp, out, cached = price(model, usage)
         compare = selfhost.compare_to(model)  # self-hosted model: baseline is the hosted API it replaces
         baseline = price(compare, usage)[0] if compare else c
         return {
             "provider": "openai", "engineer": engineer, "team": team, "feature": feature,
-            "model_requested": model, "model_used": model, "route_decision": "none", "stream": int(stream),
+            "model_requested": requested or model, "model_used": model, "route_decision": decision,
+            "stream": int(stream),
             "status": status, "latency_ms": int((time.time() - started) * 1000),
             "input_tokens": inp, "output_tokens": out, "cache_read_tokens": cached,
             "cost_usd": c, "baseline_cost_usd": baseline,
@@ -95,30 +101,75 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
         ctx.headers["content-type"] = "application/json"
         collector = traces.OutputCollector("openai")
 
+        pol = policies.get(ctx.client)
+        fb = pol.get("fallback")
+        requested = model
+
         if not stream:
-            resp = await client.post(url, content=raw, headers=ctx.headers, params=ctx.params)
-            usage = None
-            if resp.status_code == 200:
+            try:
+                resp = await client.post(url, content=raw, headers=ctx.headers, params=ctx.params)
+                status, content, out_headers = resp.status_code, resp.content, response_headers(resp)
+            except httpx.HTTPError:
+                if not fb:
+                    raise
+                status, content, out_headers = None, b"", {}
+            data = _json(content) if status == 200 else None
+            reason = policies.failure(status, data, bool(fb.get("require_json"))) if fb else None
+            extra_cost = 0.0
+            if reason:  # safety net: same request to the backup model
+                if data:
+                    extra_cost = price(model, data.get("usage"))[0]  # the failed answer was still billed
+                fb_url, fb_model, fb_headers = policies.target(fb)
                 try:
-                    data = resp.json()
-                    usage = data.get("usage")
-                    model = data.get("model") or model
-                    collector.add(data)
-                except ValueError:
-                    pass
-            row, c, inp, out = log_row(ctx, model, resp.status_code, started, False, usage)
+                    r2 = await client.post(fb_url, json={**body, "model": fb_model}, headers=fb_headers)
+                    status, content, out_headers = r2.status_code, r2.content, response_headers(r2)
+                except httpx.HTTPError as e:
+                    status, content, out_headers = 502, json.dumps({"error": {
+                        "message": f"main and backup model both failed ({reason}; backup: {type(e).__name__})",
+                        "type": "upstream_error"}}).encode(), {}
+                data = _json(content) if status == 200 else None
+                model = fb_model
+                log.warning("fallback for %s: %s -> %s", ctx.client.name if ctx.client else "-", reason, fb_model)
+            usage = None
+            if data:
+                usage = data.get("usage")
+                model = data.get("model") or model
+                collector.add(data)
+            decision = f"fallback:{reason}" if reason else "none"
+            row, c, inp, out = log_row(ctx, model, status, started, False, usage, decision, requested)
+            row["cost_usd"] += extra_cost
             await app.state.log_row(row)
-            await gateway.record(ctx, store, s, model=model, status=resp.status_code, stream=False, body=body,
+            await gateway.record(ctx, store, s, model=model, status=status, stream=False, body=body,
                                  collector=collector, input_tokens=inp, output_tokens=out, cost_usd=c, started=started)
-            return Response(content=resp.content, status_code=resp.status_code,
-                            headers={**response_headers(resp), **gateway.trace_headers(ctx)})
+            sh = pol.get("shadow")
+            if sh and not reason and data and random.random() < float(sh.get("rate", 0)):
+                task = asyncio.create_task(_shadow(app, store, ctx, sh, body, data, model, c))
+                app.state.shadow_tasks.add(task)
+                task.add_done_callback(app.state.shadow_tasks.discard)
+            extra = {"x-tokenwise-fallback": reason} if reason else {}
+            return Response(content=content, status_code=status,
+                            headers={**out_headers, **gateway.trace_headers(ctx), **extra})
 
         req = client.build_request("POST", url, content=raw, headers=ctx.headers, params=ctx.params)
-        resp = await client.send(req, stream=True)
+        decision = "none"
+        try:
+            resp = await client.send(req, stream=True)
+        except httpx.HTTPError:
+            if not fb:
+                raise
+            resp = None
+        reason = policies.failure(resp.status_code if resp else None, None, False) if fb else None
+        if reason:  # safety net for streams: only when the main model fails before answering
+            if resp is not None:
+                await resp.aclose()
+            fb_url, fb_model, fb_headers = policies.target(fb)
+            req = client.build_request("POST", fb_url, json={**body, "model": fb_model}, headers=fb_headers)
+            resp = await client.send(req, stream=True)
+            model, decision = fb_model, f"fallback:{reason}"
         if resp.status_code != 200:
             content = await resp.aread()
             await resp.aclose()
-            row, *_ = log_row(ctx, model, resp.status_code, started, True, None)
+            row, *_ = log_row(ctx, model, resp.status_code, started, True, None, decision, requested)
             await app.state.log_row(row)
             await gateway.record(ctx, store, s, model=model, status=resp.status_code, stream=True, body=body,
                                  collector=collector, started=started)
@@ -142,14 +193,16 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
                 for ev in events:
                     collector.add(ev)
                     state["usage"] = ev.get("usage") or state["usage"]
-                row, c, inp, out = log_row(ctx, state["model"], 200, started, True, state["usage"])
+                row, c, inp, out = log_row(ctx, state["model"], 200, started, True, state["usage"], decision,
+                                           requested)
                 await app.state.log_row(row)
                 await gateway.record(ctx, store, s, model=state["model"], status=200, stream=True, body=body,
                                      collector=collector, input_tokens=inp, output_tokens=out, cost_usd=c,
                                      started=started)
 
         return StreamingResponse(relay(), status_code=200,
-                                 headers={**response_headers(resp), **gateway.trace_headers(ctx)},
+                                 headers={**response_headers(resp), **gateway.trace_headers(ctx),
+                                          **({"x-tokenwise-fallback": reason} if reason else {})},
                                  media_type=resp.headers.get("content-type", "text/event-stream"))
 
     @app.api_route(PREFIX + "/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -174,3 +227,42 @@ def register(app: FastAPI, s: Settings, store: Store) -> None:
 
 def s_stream_usage() -> bool:
     return os.getenv("TOKENWISE_OPENAI_STREAM_USAGE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _json(content: bytes) -> dict | None:
+    try:
+        data = json.loads(content)
+        return data if isinstance(data, dict) else None
+    except ValueError:
+        return None
+
+
+async def _shadow(app: FastAPI, store: Store, ctx: gateway.Ctx, cfg: dict, body: dict, primary: dict,
+                  primary_model: str, primary_cost: float) -> None:
+    """Send a copy to the shadow model and store how far the answers agree (scores only, no text)."""
+    try:
+        url, model, headers = policies.target(cfg)
+        sbody = {k: v for k, v in body.items() if k not in ("stream", "stream_options")}
+        started = time.time()
+        try:
+            r = await app.state.openai_client.post(url, json={**sbody, "model": model}, headers=headers)
+            status, data = r.status_code, (_json(r.content) if r.status_code == 200 else None)
+        except httpx.HTTPError:
+            status, data = 0, None
+        ms = int((time.time() - started) * 1000)
+        ptext = policies.answer_text(primary)
+        stext = policies.answer_text(data) if data else ""
+        score, exact = policies.agreement(ptext, stext) if data else (None, False)
+        pusage = primary.get("usage") or {}
+        susage = (data or {}).get("usage") or {}
+        await asyncio.to_thread(policies.record_shadow, store, {
+            "client_id": ctx.client_id, "feature": ctx.who[2], "primary_model": primary_model, "shadow_model": model,
+            "status": status, "agreement": score, "exact": int(exact),
+            "primary_json": int(policies.as_json(ptext) is not None),
+            "shadow_json": int(policies.as_json(stext) is not None) if data else 0,
+            "shadow_ms": ms, "input_tokens": int(pusage.get("prompt_tokens") or 0),
+            "shadow_output_tokens": int(susage.get("completion_tokens") or 0),
+            "primary_cost_usd": primary_cost, "shadow_cost_usd": price(model, susage)[0] if data else 0.0,
+        })
+    except Exception:
+        log.exception("shadow test failed")

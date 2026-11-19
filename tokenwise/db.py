@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS route_decisions (
 CLIENT_NEW_COLUMNS = {
     "capture_rate": "REAL DEFAULT 1.0",    # share of requests to capture (0-1)
     "retention_days": "INTEGER DEFAULT 90", # traces older than this are deleted automatically
+    "policy": "TEXT",                       # fallback / shadow settings (policies.py), keys encrypted
 }
 
 NEW_COLUMNS = {

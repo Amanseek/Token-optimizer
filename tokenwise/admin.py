@@ -12,6 +12,9 @@
     python -m tokenwise.admin retention acme 30              # delete traces older than 30 days
     python -m tokenwise.admin purge acme --user U123 | --all # delete stored conversations now
     python -m tokenwise.admin audit [--limit 50]             # who viewed, exported or deleted what
+    python -m tokenwise.admin fallback acme --base-url URL --model M --key-env ENV [--require-json] | --off
+    python -m tokenwise.admin shadow acme --base-url URL --model M --key-env ENV --rate 0.2 | --off
+    python -m tokenwise.admin policy acme                    # show fallback/shadow settings (no keys)
 
 Upstream provider keys are read from environment variables (never typed on the
 command line, where they'd end up in shell history) and stored encrypted.
@@ -21,10 +24,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 
-from . import clients, traces
+from . import clients, policies, traces
 from .db import Store
 
 
@@ -72,6 +76,19 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--user")
     g.add_argument("--all", action="store_true")
     sub.add_parser("audit").add_argument("--limit", type=int, default=50)
+    for kind, helptext in (("fallback", "backup model when the main one fails (safety net)"),
+                           ("shadow", "second model that gets a copy of some requests, to compare answers")):
+        x = sub.add_parser(kind, help=helptext)
+        x.add_argument("name")
+        x.add_argument("--base-url", help="OpenAI-compatible URL, e.g. https://generativelanguage.googleapis.com/v1beta/openai")
+        x.add_argument("--model")
+        x.add_argument("--key-env", help="env var holding that host's API key")
+        x.add_argument("--off", action="store_true")
+        if kind == "fallback":
+            x.add_argument("--require-json", action="store_true", help="also fall back when the answer isn't JSON")
+        else:
+            x.add_argument("--rate", type=float, default=0.1, help="share of requests to copy (0-1)")
+    sub.add_parser("policy").add_argument("name")
     a = ap.parse_args(argv)
 
     if a.cmd == "new-secret":
@@ -135,6 +152,21 @@ def main(argv: list[str] | None = None) -> int:
             n = traces.delete_for(store, client_id(a.name), user=a.user, everything=a.all)
             store.audit("cli", "delete", f"{a.name}:" + ("all" if a.all else f"user:{a.user}"), f"{n} traces deleted")
             print(f"deleted {n} traces")
+        elif a.cmd in ("fallback", "shadow"):
+            if a.off:
+                policies.clear(store, a.name, a.cmd)
+                print(f"{a.cmd} off for {a.name}")
+            else:
+                if not (a.base_url and a.model and a.key_env):
+                    raise ValueError("--base-url, --model and --key-env are required (or --off)")
+                extra = {"require_json": a.require_json} if a.cmd == "fallback" else {"rate": a.rate}
+                if a.cmd == "shadow" and not 0 < a.rate <= 1:
+                    raise ValueError("rate must be above 0 and at most 1")
+                policies.set_target(store, a.name, a.cmd, a.base_url, a.model, _env(a.key_env), **extra)
+                store.audit("cli", f"set_{a.cmd}", a.name, f"{a.model} @ {a.base_url}")
+                print(f"{a.cmd} for {a.name}: {a.model} at {a.base_url} {extra}")
+        elif a.cmd == "policy":
+            print(json.dumps(policies.describe(store, a.name), indent=1))
         elif a.cmd == "audit":
             for r in store.query("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (a.limit,)):
                 when = dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M")

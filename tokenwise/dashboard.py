@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import time
 
-from . import selfhost
+from . import policies, selfhost
 from .db import Store
 
 
@@ -85,6 +85,8 @@ def summary(store: Store, days: int = 30) -> dict:
         "by_day": by_day,
         "routing": routing,
         "self_hosted": own,
+        "shadow": policies.shadow_summary(store, since),
+        "fallbacks": policies.fallback_summary(store, since),
     }
 
 
@@ -124,6 +126,36 @@ def _self_hosted_section(r: dict | None) -> str:
     else:
         note = "Break-even appears after the first requests."
     return f"<h2>Own GPU vs hosted API</h2>{table}<p class=note>{note}</p>"
+
+
+def _pct(x) -> str:
+    return "-" if x is None else f"{100 * x:.0f}%"
+
+
+def _per_1k(total, n) -> str:
+    return _money(1000 * (total or 0) / n) if n else "-"
+
+
+def _quality_sections(s: dict) -> str:
+    out = ""
+    if s["shadow"]:
+        rows = [[r["client"], r["feature"], f"{r['primary_model']} → {r['shadow_model']}", r["samples"],
+                 _pct(r["agreement"]), _pct(r["exact"]), _pct(r["shadow_json"]),
+                 f"{(r['shadow_ms'] or 0) / 1000:.1f}s",
+                 f"{_per_1k(r['primary_cost'], r['samples'])} → {_per_1k(r['shadow_cost'], r['answered'])}"]
+                for r in s["shadow"]]
+        out += ("<h2>Shadow tests (same requests, second model)</h2>" + _table(
+            ["Client", "Feature", "Main → shadow", "Samples", "Agreement", "Exact same", "Valid JSON",
+             "Shadow speed", "Cost per 1,000 (main → shadow)"], rows)
+            + "<p class=note>Agreement: for JSON answers, the share of fields the shadow model got the same; "
+              "for text, word overlap. Only scores are stored, not the answers. A self-hosted shadow shows "
+              "$0 per request; its GPU cost is in the section above.</p>")
+    if s["fallbacks"]:
+        rows = [[r["client"], r["decision"].split(":", 1)[1].replace("_", " "), r["requests"]] for r in s["fallbacks"]]
+        out += ("<h2>Safety net (answered by the backup model)</h2>" + _table(["Client", "Reason", "Requests"], rows)
+                + "<p class=note>unreachable = main model offline (e.g. GPU stopped); cut off = hit the length "
+                  "limit; bad json = answer wasn't valid JSON.</p>")
+    return out
 
 
 def _table(headers: list[str], rows: list[list]) -> str:
@@ -212,6 +244,7 @@ th,td{{text-align:left;padding:8px;border-bottom:1px solid #eee}} th{{color:#6b7
 <div class=tiles>{tile_html}</div>
 {opt_note}{cache_note}
 {_self_hosted_section(s["self_hosted"])}
+{_quality_sections(s)}
 {wf_section}
 <h2>By provider</h2>{providers}
 <h2>By feature</h2>{features}
