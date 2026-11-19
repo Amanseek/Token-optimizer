@@ -15,6 +15,8 @@ client app ──tw- key──► Tokenwise gateway ──► vLLM on one GPU: b
 | `serve/start_vllm.sh` | Serves one base model plus every adapter in `ADAPTERS_DIR` (OpenAI-compatible, API key required) |
 | `serve/register_adapter.py` | Adds or removes an adapter on a running server, no restart |
 | `serve/Dockerfile` | The serving server as a container |
+| `serve/hf_server.py` | Same API with plain transformers + peft, for GPUs vLLM doesn't support (V100, T4) and quick demos |
+| `serve/start_e2e.sh` | One command on an E2E TIR container: model server + Tokenwise + public HTTPS link + self-test |
 | `kaggle_e2e.ipynb` | The whole flow on one free Kaggle GPU (train → serve → call through Tokenwise → evaluate) |
 
 ## First client: step by step
