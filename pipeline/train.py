@@ -142,7 +142,9 @@ def main(argv: list[str] | None = None) -> None:
     held = []
     if a.check:
         held, examples = examples[-a.check:], examples[:-a.check]
-    bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    # Real bf16 needs compute capability 8.0+ (A100/L4/H100). Newer torch reports bf16 as
+    # "supported" on a T4 (7.5) through emulation, but matmuls then fail, so check the hardware.
+    bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
     dtype = torch.bfloat16 if bf16 else torch.float16
 
     tok = AutoTokenizer.from_pretrained(a.base)
